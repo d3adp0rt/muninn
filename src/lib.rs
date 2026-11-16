@@ -4,9 +4,16 @@
 //! for local development.
 
 mod app;
+mod platform;
 mod theme;
 
+pub mod api;
+
 pub use app::MuninnApp;
+
+#[cfg(target_os = "android")]
+pub(crate) static ANDROID_APP: std::sync::OnceLock<winit::platform::android::activity::AndroidApp> =
+    std::sync::OnceLock::new();
 
 #[cfg(target_os = "android")]
 mod android_entry {
@@ -25,6 +32,9 @@ mod android_entry {
         );
 
         log::info!("Muninn starting");
+
+        // Keep a clone for insets; eframe consumes the original for winit.
+        let _ = crate::ANDROID_APP.set(app.clone());
 
         let options = eframe::NativeOptions {
             android_app: Some(app),

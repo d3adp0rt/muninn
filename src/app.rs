@@ -4,9 +4,7 @@
 //! Android stack (GameActivity, IME, wgpu, edge-to-edge insets) before the
 //! real domain model lands.
 
-use eframe::egui::{
-    self, Align, CornerRadius, Layout, Margin, RichText, ScrollArea, Vec2,
-};
+use eframe::egui::{self, Align, CornerRadius, Layout, Margin, RichText, ScrollArea, Vec2};
 
 use crate::theme;
 
@@ -17,7 +15,7 @@ pub struct MuninnApp {
     models: Vec<&'static str>,
     deep_think: bool,
     web: bool,
-    cost: f64,
+    ime_focused: bool,
 }
 
 struct Message {
@@ -77,7 +75,7 @@ impl MuninnApp {
             ],
             deep_think: true,
             web: false,
-            cost: 0.000_045,
+            ime_focused: false,
         }
     }
 
@@ -87,6 +85,7 @@ impl MuninnApp {
             return;
         }
         self.draft.clear();
+        crate::platform::set_ime_text("", 0);
         self.messages.push(Message {
             role: Role::User,
             text,
@@ -96,15 +95,13 @@ impl MuninnApp {
         });
         self.messages.push(Message {
             role: Role::Assistant,
-            text: "M0 shell: сеть ещё не подключена. Следующий шаг — SSE-стрим OpenRouter."
-                .into(),
+            text: "M0 shell: сеть ещё не подключена. Следующий шаг — SSE-стрим OpenRouter.".into(),
             reasoning: self
                 .deep_think
                 .then(|| "Запрос получен, но транспорт ещё не реализован.".into()),
             cost: Some(0.0),
             tokens: Some(12),
         });
-        self.cost += 0.0;
     }
 
     fn header(&mut self, ui: &mut egui::Ui) {
@@ -114,15 +111,16 @@ impl MuninnApp {
             ui.label(RichText::new("M0").size(11.0).color(theme::MUTED));
 
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let short = self.model.rsplit('/').next().unwrap_or(&self.model);
                 let chip = egui::Button::new(
-                    RichText::new(format!("{}  ▾", self.model))
+                    RichText::new(format!("{short}  v"))
                         .size(12.5)
                         .color(theme::TEXT),
                 )
                 .fill(theme::CARD)
                 .corner_radius(16);
 
-                if ui.add(chip).clicked() {
+                if ui.add(chip).on_hover_text(&self.model).clicked() {
                     let idx = self
                         .models
                         .iter()
@@ -130,18 +128,18 @@ impl MuninnApp {
                         .unwrap_or(0);
                     self.model = self.models[(idx + 1) % self.models.len()].to_owned();
                 }
-
-                ui.label(
-                    RichText::new(format!("${:.6}", self.cost))
-                        .size(11.5)
-                        .color(theme::MUTED),
-                );
             });
         });
     }
 
     fn bubble(&self, ui: &mut egui::Ui, msg: &Message) {
         let is_user = msg.role == Role::User;
+
+        // `ScrollArea` can report an unbounded width here; the clip rect is the
+        // reliable viewport width.
+        let viewport = ui.clip_rect().width();
+        let max_w = (viewport * if is_user { 0.84 } else { 0.88 }).max(140.0);
+        let text_w = (max_w - 28.0).max(100.0);
 
         if is_user {
             ui.with_layout(Layout::right_to_left(Align::TOP), |ui| {
@@ -150,8 +148,8 @@ impl MuninnApp {
                     .corner_radius(18)
                     .inner_margin(Margin::symmetric(14, 10))
                     .show(ui, |ui| {
-                        ui.set_max_width((ui.available_width() * 0.82).max(120.0));
-                        ui.label(RichText::new(&msg.text).size(15.5).color(theme::TEXT));
+                        ui.set_max_width(text_w);
+                        ui.add(egui::Label::new(RichText::new(&msg.text).size(15.5)).wrap());
                     });
             });
         } else {
@@ -161,7 +159,7 @@ impl MuninnApp {
                     .corner_radius(18)
                     .inner_margin(Margin::symmetric(14, 10))
                     .show(ui, |ui| {
-                        ui.set_max_width((ui.available_width() * 0.86).max(120.0));
+                        ui.set_max_width(text_w);
 
                         if let Some(reasoning) = &msg.reasoning {
                             let tokens = msg.tokens.unwrap_or(0);
@@ -172,17 +170,20 @@ impl MuninnApp {
                             )
                             .default_open(false)
                             .show(ui, |ui| {
-                                ui.label(
-                                    RichText::new(reasoning)
-                                        .monospace()
-                                        .size(12.5)
-                                        .color(theme::MUTED),
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(reasoning)
+                                            .monospace()
+                                            .size(12.5)
+                                            .color(theme::MUTED),
+                                    )
+                                    .wrap(),
                                 );
                             });
                             ui.add_space(2.0);
                         }
 
-                        ui.label(RichText::new(&msg.text).size(15.5));
+                        ui.add(egui::Label::new(RichText::new(&msg.text).size(15.5)).wrap());
                     });
 
                 if let (Some(cost), Some(tokens)) = (msg.cost, msg.tokens) {
@@ -202,7 +203,12 @@ impl MuninnApp {
     fn empty_state(&self, ui: &mut egui::Ui) {
         ui.add_space(ui.available_height() * 0.18);
         ui.vertical_centered(|ui| {
-            ui.label(RichText::new("MUNINN").size(34.0).strong().color(theme::TEXT));
+            ui.label(
+                RichText::new("MUNINN")
+                    .size(34.0)
+                    .strong()
+                    .color(theme::TEXT),
+            );
             ui.add_space(6.0);
             ui.label(
                 RichText::new("Память. Ветки. Агент.")
@@ -234,7 +240,11 @@ impl MuninnApp {
             ui.label(
                 RichText::new(if self.web { "web: on" } else { "web: off" })
                     .size(11.0)
-                    .color(if self.web { theme::ACCENT } else { theme::MUTED }),
+                    .color(if self.web {
+                        theme::ACCENT
+                    } else {
+                        theme::MUTED
+                    }),
             );
         });
 
@@ -255,10 +265,27 @@ impl MuninnApp {
 
                 let resp = ui.add(edit);
 
+                // winit 0.30's Android backend does not forward IME commits, so
+                // bridge the GameActivity text state into the draft by polling
+                // while the composer has focus.
+                if resp.has_focus() {
+                    ui.ctx()
+                        .request_repaint_after(std::time::Duration::from_millis(50));
+
+                    if !self.ime_focused {
+                        crate::platform::set_ime_text(&self.draft, self.draft.len());
+                        self.ime_focused = true;
+                    } else if let Some(text) = crate::platform::ime_text()
+                        && text != self.draft
+                    {
+                        self.draft = text;
+                    }
+                } else if self.ime_focused {
+                    self.ime_focused = false;
+                }
+
                 let enter = resp.has_focus()
-                    && ui.input(|i| {
-                        i.key_pressed(egui::Key::Enter) && !i.modifiers.shift
-                    });
+                    && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
                 if enter {
                     submit = true;
                 }
@@ -267,13 +294,13 @@ impl MuninnApp {
 
                 ui.horizontal(|ui| {
                     if ui
-                        .add(egui::Button::new(RichText::new("＋").size(17.0)).frame(false))
+                        .add(egui::Button::new(RichText::new("+").size(20.0)).frame(false))
                         .clicked()
                     {
                         // Attachments land here in M2.
                     }
                     if ui
-                        .add(egui::Button::new(RichText::new("🎙").size(14.0)).frame(false))
+                        .add(egui::Button::new(RichText::new("Mic").size(11.5)).frame(false))
                         .clicked()
                     {
                         // STT lands here in M2.
@@ -325,6 +352,16 @@ impl MuninnApp {
 
 impl eframe::App for MuninnApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let insets = crate::platform::system_insets(ui);
+
+        if insets.top > 0.5 {
+            egui::Panel::top("muninn_safe_top")
+                .exact_size(insets.top)
+                .show_separator_line(false)
+                .frame(egui::Frame::new().fill(theme::SURFACE))
+                .show(ui, |_| {});
+        }
+
         egui::Panel::top("muninn_header")
             .exact_size(56.0)
             .frame(
@@ -334,6 +371,14 @@ impl eframe::App for MuninnApp {
             )
             .show(ui, |ui| self.header(ui));
 
+        if insets.bottom > 0.5 {
+            egui::Panel::bottom("muninn_safe_bottom")
+                .exact_size(insets.bottom)
+                .show_separator_line(false)
+                .frame(egui::Frame::new().fill(theme::BG))
+                .show(ui, |_| {});
+        }
+
         egui::Panel::bottom("muninn_composer")
             .frame(
                 egui::Frame::new()
@@ -342,11 +387,13 @@ impl eframe::App for MuninnApp {
             )
             .show(ui, |ui| self.composer(ui));
 
+        let side = (12.0 + insets.left.max(insets.right)).round() as i8;
+
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
                     .fill(theme::BG)
-                    .inner_margin(Margin::symmetric(12, 0)),
+                    .inner_margin(Margin::symmetric(side, 0)),
             )
             .show(ui, |ui| {
                 ScrollArea::vertical()

@@ -24,6 +24,19 @@ desktop = []
 [dependencies]
 log = "0.4"
 egui = "0.37"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio-stream = "0.1"
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls-webpki-roots",
+    "json",
+    "stream",
+    "gzip",
+] }
+futures-util = "0.3"
+bytes = "1"
 
 [target.'cfg(target_os = "android")'.dependencies]
 eframe = { version = "0.37", default-features = false, features = [
@@ -33,6 +46,7 @@ eframe = { version = "0.37", default-features = false, features = [
 ] }
 winit = "0.30"
 android_logger = "0.15"
+android-activity = { version = "0.6", features = ["game-activity"] }
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
 eframe = { version = "0.37", default-features = false, features = [

@@ -3,7 +3,10 @@
 //! Dark, quiet, Claude/DeepSeek-inspired: near-black surfaces, soft bubbles,
 //! a single violet accent, generous spacing.
 
-use egui::{Color32, CornerRadius, FontFamily, FontId, TextStyle, Vec2, Visuals};
+use egui::{
+    Color32, CornerRadius, FontData, FontFamily, FontId, FontInsert, FontPriority,
+    InsertFontFamily, TextStyle, Vec2, Visuals,
+};
 
 pub const BG: Color32 = Color32::from_rgb(11, 12, 16);
 pub const SURFACE: Color32 = Color32::from_rgb(17, 18, 24);
@@ -16,6 +19,8 @@ pub const MUTED: Color32 = Color32::from_rgb(148, 151, 163);
 pub const BORDER: Color32 = Color32::from_rgb(38, 39, 49);
 
 pub fn apply(ctx: &egui::Context) {
+    install_fonts(ctx);
+
     ctx.set_theme(egui::ThemePreference::Dark);
 
     let mut style = (*ctx.style_of(egui::Theme::Dark)).clone();
@@ -41,13 +46,67 @@ pub fn apply(ctx: &egui::Context) {
     style.spacing.item_spacing = Vec2::new(8.0, 8.0);
     style.spacing.button_padding = Vec2::new(12.0, 8.0);
     style.text_styles = [
-        (TextStyle::Heading, FontId::new(22.0, FontFamily::Proportional)),
+        (
+            TextStyle::Heading,
+            FontId::new(22.0, FontFamily::Proportional),
+        ),
         (TextStyle::Body, FontId::new(15.5, FontFamily::Proportional)),
-        (TextStyle::Button, FontId::new(14.5, FontFamily::Proportional)),
-        (TextStyle::Small, FontId::new(12.0, FontFamily::Proportional)),
-        (TextStyle::Monospace, FontId::new(13.0, FontFamily::Monospace)),
+        (
+            TextStyle::Button,
+            FontId::new(14.5, FontFamily::Proportional),
+        ),
+        (
+            TextStyle::Small,
+            FontId::new(12.0, FontFamily::Proportional),
+        ),
+        (
+            TextStyle::Monospace,
+            FontId::new(13.0, FontFamily::Monospace),
+        ),
     ]
     .into();
 
     ctx.set_style_of(egui::Theme::Dark, style);
+}
+
+fn install_fonts(ctx: &egui::Context) {
+    // Inter is the UI face; Noto Emoji and egui's icon font are fallbacks.
+    ctx.add_font(FontInsert {
+        name: "inter".to_owned(),
+        data: FontData::from_static(include_bytes!("../assets/fonts/InterVariable.ttf")),
+        families: vec![InsertFontFamily {
+            family: FontFamily::Proportional,
+            priority: FontPriority::Highest,
+        }],
+    });
+
+    ctx.add_font(FontInsert {
+        name: "noto-emoji".to_owned(),
+        data: FontData::from_static(include_bytes!("../assets/fonts/NotoEmoji-Regular.ttf")),
+        families: vec![
+            InsertFontFamily {
+                family: FontFamily::Proportional,
+                priority: FontPriority::Lowest,
+            },
+            InsertFontFamily {
+                family: FontFamily::Monospace,
+                priority: FontPriority::Lowest,
+            },
+        ],
+    });
+
+    ctx.add_font(FontInsert {
+        name: "emoji-icon-font".to_owned(),
+        data: FontData::from_static(include_bytes!("../assets/fonts/emoji-icon-font.ttf")),
+        families: vec![
+            InsertFontFamily {
+                family: FontFamily::Proportional,
+                priority: FontPriority::Lowest,
+            },
+            InsertFontFamily {
+                family: FontFamily::Monospace,
+                priority: FontPriority::Lowest,
+            },
+        ],
+    });
 }
