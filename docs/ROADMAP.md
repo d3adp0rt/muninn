@@ -26,8 +26,9 @@ themes, RU/EN, SQLCipher, app-lock, trash/undo, export.
 
 Done: onboarding, streaming + markdown + code copy, reasoning-on-tap,
 per-chat cost, per-chat model, personas with three prompt layers, chat
-rename/delete/regenerate/retry, themes, model picker. Remaining: branching,
-edits as tree children, SQLCipher, app-lock, export, RU/EN toggle.
+rename/delete/regenerate/retry, themes, model picker, conversation tree with
+edited branches and answer variants. Remaining: a tree overview, SQLCipher,
+app-lock, export, RU/EN toggle.
 
 ## M2 — multimodal + search
 

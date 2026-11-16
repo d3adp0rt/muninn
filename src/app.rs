@@ -55,7 +55,11 @@ pub struct MuninnApp {
     confirm_chat_delete: bool,
 
     title: String,
-    messages: Vec<Message>,
+    tree: Vec<Message>,
+    leaf: Option<u64>,
+    stream_node: Option<u64>,
+    editing: Option<u64>,
+    draft_before_edit: Option<String>,
     draft: String,
     active_input: Option<i32>,
     active_rect: Rect,
@@ -89,6 +93,12 @@ enum Sheet {
     PersonaEditor,
     Prompt,
     ChatInfo,
+}
+
+enum BubbleAction {
+    Regenerate(u64),
+    Edit(u64),
+    Switch(u64),
 }
 
 /// Scratch copy of a persona while the editor sheet is open.
@@ -164,13 +174,51 @@ struct ModelEntry {
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Message {
+    /// Stable node id inside the chat tree. Zero on legacy records.
+    #[serde(default)]
+    id: u64,
+    /// Parent node; `None` for the first message of a branch.
+    #[serde(default)]
+    parent: Option<u64>,
     role: Role,
     text: String,
     reasoning: Option<String>,
     cost: Option<f64>,
     tokens: Option<u64>,
+    #[serde(default)]
     streaming: bool,
+    #[serde(default)]
     error: bool,
+}
+
+impl Message {
+    fn user(id: u64, parent: Option<u64>, text: String) -> Self {
+        Self {
+            id,
+            parent,
+            role: Role::User,
+            text,
+            reasoning: None,
+            cost: None,
+            tokens: None,
+            streaming: false,
+            error: false,
+        }
+    }
+
+    fn assistant(id: u64, parent: Option<u64>) -> Self {
+        Self {
+            id,
+            parent,
+            role: Role::Assistant,
+            text: String::new(),
+            reasoning: None,
+            cost: None,
+            tokens: None,
+            streaming: true,
+            error: false,
+        }
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -181,7 +229,13 @@ struct ChatSnapshot {
     cost: f64,
     tokens: u64,
     updated_at: u64,
+    /// Legacy linear history, migrated into `nodes` on load.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     messages: Vec<Message>,
+    #[serde(default)]
+    nodes: Vec<Message>,
+    #[serde(default)]
+    leaf: Option<u64>,
     /// Empty string means "no persona"; old chats load without one.
     #[serde(default)]
     persona_id: String,
@@ -243,7 +297,11 @@ impl MuninnApp {
             confirm_persona_delete: false,
             confirm_chat_delete: false,
             title: "Новый чат".to_owned(),
-            messages: Vec::new(),
+            tree: Vec::new(),
+            leaf: None,
+            stream_node: None,
+            editing: None,
+            draft_before_edit: None,
             draft: String::new(),
             active_input: None,
             active_rect: Rect::NOTHING,
@@ -396,6 +454,118 @@ impl MuninnApp {
         self.base_url.contains("openrouter.ai")
     }
 
+    // ------------------------------------------------------------------
+    // Conversation tree
+    // ------------------------------------------------------------------
+
+    fn node(&self, id: u64) -> Option<&Message> {
+        self.tree.iter().find(|node| node.id == id)
+    }
+
+    fn node_mut(&mut self, id: u64) -> Option<&mut Message> {
+        self.tree.iter_mut().find(|node| node.id == id)
+    }
+
+    fn path_ids(&self) -> Vec<u64> {
+        tree_path(&self.tree, self.leaf)
+    }
+
+    fn siblings(&self, id: u64) -> Vec<u64> {
+        tree_siblings(&self.tree, id)
+    }
+
+    fn latest_leaf(&self, id: u64) -> u64 {
+        tree_latest_leaf(&self.tree, id)
+    }
+
+    fn fresh_id(&self) -> u64 {
+        let mut id = next_id();
+        while self.tree.iter().any(|node| node.id == id) {
+            id = id.wrapping_add(1);
+        }
+        id
+    }
+
+    fn tip_text(&self) -> String {
+        self.leaf
+            .and_then(|id| self.node(id))
+            .map(|node| node.text.clone())
+            .unwrap_or_default()
+    }
+
+    fn chat_preview(chat: &ChatSnapshot) -> String {
+        chat.leaf
+            .and_then(|id| chat.nodes.iter().find(|node| node.id == id))
+            .map(|node| node.text.clone())
+            .unwrap_or_default()
+    }
+
+    /// Drop a trailing assistant placeholder left by an interrupted launch.
+    fn drop_empty_tail(&mut self) {
+        while let Some(id) = self.leaf {
+            let Some(node) = self.node(id) else {
+                self.leaf = None;
+                break;
+            };
+
+            let empty = node.role == Role::Assistant
+                && node.text.is_empty()
+                && node.reasoning.is_none()
+                && !node.error;
+            if !empty || self.tree.iter().any(|child| child.parent == Some(id)) {
+                break;
+            }
+
+            let parent = node.parent;
+            if let Some(position) = self.tree.iter().position(|node| node.id == id) {
+                self.tree.remove(position);
+            }
+            self.leaf = parent;
+        }
+    }
+
+    fn edit_message(&mut self, node_id: u64) {
+        if self.streaming {
+            return;
+        }
+        let Some(text) = self.node(node_id).map(|node| node.text.clone()) else {
+            return;
+        };
+
+        self.stop_native();
+        self.draft_before_edit = Some(std::mem::take(&mut self.draft));
+        self.editing = Some(node_id);
+        self.draft = text;
+        self.focus_composer = true;
+        self.scroll_to_bottom = true;
+    }
+
+    fn cancel_edit(&mut self) {
+        self.stop_native();
+        self.editing = None;
+        self.draft = self.draft_before_edit.take().unwrap_or_default();
+        self.repaint_ticks = 30;
+    }
+
+    fn switch_variant(&mut self, node_id: u64) {
+        if self.streaming {
+            return;
+        }
+
+        self.stop_native();
+        if self.editing.take().is_some() {
+            self.draft = self.draft_before_edit.take().unwrap_or_default();
+        }
+        let tip = self.latest_leaf(node_id);
+        self.leaf = Some(tip);
+        self.scroll_to_bottom = true;
+        self.save_current();
+    }
+
+    // ------------------------------------------------------------------
+    // Networking
+    // ------------------------------------------------------------------
+
     fn send(&mut self, ctx: &egui::Context) {
         if self.streaming {
             return;
@@ -412,65 +582,90 @@ impl MuninnApp {
             self.title = text.chars().take(48).collect();
         }
 
-        self.messages.push(Message {
-            role: Role::User,
-            text,
-            reasoning: None,
-            cost: None,
-            tokens: None,
-            streaming: false,
-            error: false,
-        });
+        // Editing an older user turn creates a sibling branch from its parent.
+        let parent = match self.editing.take() {
+            Some(edited) => self.node(edited).and_then(|node| node.parent),
+            None => self.leaf,
+        };
 
+        let user_id = self.fresh_id();
+        self.tree.push(Message::user(user_id, parent, text));
+        self.leaf = Some(user_id);
+
+        // The request is the active path, which now ends with the new user turn.
         let request = self.build_request();
 
-        self.messages.push(placeholder());
+        let assistant_id = self.fresh_id();
+        self.tree
+            .push(Message::assistant(assistant_id, Some(user_id)));
+        self.leaf = Some(assistant_id);
+        self.stream_node = Some(assistant_id);
         self.scroll_to_bottom = true;
         self.stop_native();
         self.draft.clear();
+        self.draft_before_edit = None;
         self.save_current();
         hide_keyboard(ctx);
         self.streaming = true;
         self.launch(ctx, request);
     }
 
-    /// Drop the last answer and ask the model again with the same history.
-    fn regenerate(&mut self, ctx: &egui::Context) {
+    /// Ask again from the same parent, keeping the old answer as a variant.
+    fn regenerate(&mut self, ctx: &egui::Context, node_id: u64) {
         if self.streaming {
             return;
         }
 
-        self.stop_native();
-        while self
-            .messages
-            .last()
-            .is_some_and(|message| message.role == Role::Assistant)
-        {
-            self.messages.pop();
-        }
-
-        if !self
-            .messages
-            .iter()
-            .any(|message| message.role == Role::User)
-        {
+        let Some(node) = self.node(node_id) else {
+            return;
+        };
+        if node.role != Role::Assistant {
             return;
         }
+        let Some(parent) = node.parent else {
+            return;
+        };
+        let failed = node.error;
 
-        let request = self.build_request();
-        self.messages.push(placeholder());
+        self.stop_native();
+        if self.editing.take().is_some() {
+            self.draft = self.draft_before_edit.take().unwrap_or_default();
+        }
         self.scroll_to_bottom = true;
+
+        // A failed attempt is not a real variant: retry it in place. A normal
+        // answer is kept and the retry becomes its sibling.
+        let assistant_id = if failed {
+            if let Some(msg) = self.node_mut(node_id) {
+                msg.text.clear();
+                msg.reasoning = None;
+                msg.cost = None;
+                msg.tokens = None;
+                msg.error = false;
+                msg.streaming = true;
+            }
+            node_id
+        } else {
+            let id = self.fresh_id();
+            self.tree.push(Message::assistant(id, Some(parent)));
+            id
+        };
+
+        self.leaf = Some(assistant_id);
+        let request = self.build_request();
+        self.stream_node = Some(assistant_id);
         self.save_current();
         hide_keyboard(ctx);
         self.streaming = true;
         self.launch(ctx, request);
     }
 
-    /// Assemble the request: system layers, then the visible conversation.
+    /// Assemble the request: system layers, then the visible branch.
     fn build_request(&self) -> ChatRequest {
         let mut history: Vec<RequestMessage> = self
-            .messages
-            .iter()
+            .path_ids()
+            .into_iter()
+            .filter_map(|id| self.node(id))
             .filter(|message| !message.error && !message.text.is_empty())
             .map(|message| RequestMessage::text(message.role, message.text.clone()))
             .collect();
@@ -564,7 +759,7 @@ impl MuninnApp {
             task.abort();
         }
         self.streaming = false;
-        if let Some(msg) = self.messages.last_mut() {
+        if let Some(msg) = self.stream_node.take().and_then(|id| self.node_mut(id)) {
             msg.streaming = false;
             if msg.text.is_empty() {
                 msg.text = "[остановлено]".into();
@@ -576,7 +771,7 @@ impl MuninnApp {
     fn fail_last(&mut self, error: String) {
         self.streaming = false;
         self.stream_task = None;
-        if let Some(msg) = self.messages.last_mut() {
+        if let Some(msg) = self.stream_node.take().and_then(|id| self.node_mut(id)) {
             msg.streaming = false;
             msg.error = true;
             if msg.text.is_empty() {
@@ -601,12 +796,12 @@ impl MuninnApp {
                     self.error = Some(error);
                 }
                 UiEvent::Delta(text) => {
-                    if let Some(msg) = self.messages.last_mut() {
+                    if let Some(msg) = self.stream_node.and_then(|id| self.node_mut(id)) {
                         msg.text.push_str(&text);
                     }
                 }
                 UiEvent::Reasoning(text) => {
-                    if let Some(msg) = self.messages.last_mut() {
+                    if let Some(msg) = self.stream_node.and_then(|id| self.node_mut(id)) {
                         msg.reasoning
                             .get_or_insert_with(String::new)
                             .push_str(&text);
@@ -616,7 +811,7 @@ impl MuninnApp {
                     let cost = usage.cost.unwrap_or(0.0);
                     self.chat_cost += cost;
                     self.chat_tokens += usage.total_tokens;
-                    if let Some(msg) = self.messages.last_mut() {
+                    if let Some(msg) = self.stream_node.and_then(|id| self.node_mut(id)) {
                         msg.cost = usage.cost;
                         msg.tokens = Some(usage.total_tokens);
                     }
@@ -625,7 +820,7 @@ impl MuninnApp {
                     self.streaming = false;
                     self.scroll_to_bottom = true;
                     self.stream_task = None;
-                    if let Some(msg) = self.messages.last_mut() {
+                    if let Some(msg) = self.stream_node.take().and_then(|id| self.node_mut(id)) {
                         msg.streaming = false;
                         if msg.text.is_empty() && !msg.error {
                             msg.text = "[пустой ответ]".into();
@@ -710,7 +905,10 @@ impl MuninnApp {
         self.base_url = OPENROUTER_BASE.to_owned();
         self.connecting = false;
         self.models.clear();
-        self.messages.clear();
+        self.tree.clear();
+        self.leaf = None;
+        self.stream_node = None;
+        self.editing = None;
         self.title = "Новый чат".into();
         self.chat_cost = 0.0;
         self.chat_tokens = 0;
@@ -728,6 +926,9 @@ impl MuninnApp {
             && let Ok(workspace) = serde_json::from_slice::<Workspace>(&bytes)
         {
             self.chats = workspace.chats;
+            for chat in &mut self.chats {
+                migrate_chat(chat);
+            }
             self.active = workspace.active;
             self.theme_mode = workspace.theme;
             if !workspace.personas.is_empty() {
@@ -758,6 +959,8 @@ impl MuninnApp {
             tokens: 0,
             updated_at: now_secs(),
             messages: Vec::new(),
+            nodes: Vec::new(),
+            leaf: None,
             persona_id: self.persona_id.clone(),
             system_prompt: String::new(),
         }
@@ -779,18 +982,18 @@ impl MuninnApp {
         self.scroll_to_bottom = true;
         self.persona_id = chat.persona_id.clone();
         self.chat_prompt = chat.system_prompt.clone();
-        self.messages = chat.messages.clone();
+        self.tree = chat.nodes.clone();
+        self.leaf = chat.leaf;
+        self.stream_node = None;
+        self.editing = None;
+        self.draft_before_edit = None;
 
-        for message in &mut self.messages {
+        for message in &mut self.tree {
             message.streaming = false;
         }
-        // A stream interrupted before the first token leaves an empty bubble.
-        self.messages.retain(|message| {
-            !(message.role == Role::Assistant
-                && message.text.is_empty()
-                && message.reasoning.is_none()
-                && !message.error)
-        });
+
+        // A stream interrupted before the first token leaves an empty tail.
+        self.drop_empty_tail();
     }
 
     fn save_current(&mut self) {
@@ -812,7 +1015,9 @@ impl MuninnApp {
             cost: self.chat_cost,
             tokens: self.chat_tokens,
             updated_at: now_secs(),
-            messages: self.messages.clone(),
+            messages: Vec::new(),
+            nodes: self.tree.clone(),
+            leaf: self.leaf,
             persona_id: self.persona_id.clone(),
             system_prompt: self.chat_prompt.clone(),
         };
@@ -907,8 +1112,16 @@ impl MuninnApp {
         });
     }
 
-    fn bubble(&self, ui: &mut Ui, msg: &Message, last: bool) -> bool {
-        let mut retry = false;
+    fn bubble(
+        &self,
+        ui: &mut Ui,
+        msg: &Message,
+        last: bool,
+        siblings: &[u64],
+        position: usize,
+    ) -> Option<BubbleAction> {
+        let mut action = None;
+        let can_act = !self.streaming;
         let is_user = msg.role == Role::User;
         let viewport = ui.clip_rect().width();
         let max_w = (viewport * if is_user { 0.84 } else { 0.94 }).max(160.0);
@@ -932,8 +1145,28 @@ impl MuninnApp {
                         );
                     });
             });
-            ui.add_space(14.0);
-            return false;
+
+            if can_act {
+                let mut edit = false;
+                let mut nav = None;
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if siblings.len() > 1 {
+                        nav = branch_nav(ui, position, siblings.len());
+                    }
+                    if link_button(ui, "изменить").clicked() {
+                        edit = true;
+                    }
+                });
+                if let Some(index) = nav {
+                    action = Some(BubbleAction::Switch(siblings[index]));
+                }
+                if edit {
+                    action = Some(BubbleAction::Edit(msg.id));
+                }
+            }
+
+            ui.add_space(10.0);
+            return action;
         }
 
         ui.with_layout(Layout::top_down(Align::Min), |ui| {
@@ -996,10 +1229,10 @@ impl MuninnApp {
                             )
                             .wrap(),
                         );
-                        if last {
+                        if last && can_act {
                             ui.add_space(8.0);
                             if pill_button(ui, "Повторить").clicked() {
-                                retry = true;
+                                action = Some(BubbleAction::Regenerate(msg.id));
                             }
                         }
                     });
@@ -1022,8 +1255,14 @@ impl MuninnApp {
                     if link_button(ui, "копировать").clicked() {
                         crate::platform::clipboard_set(&msg.text);
                     }
-                    if last && !msg.error && link_button(ui, "ещё раз").clicked() {
-                        retry = true;
+                    if last && can_act && !msg.error && link_button(ui, "ещё раз").clicked() {
+                        action = Some(BubbleAction::Regenerate(msg.id));
+                    }
+                    if can_act
+                        && siblings.len() > 1
+                        && let Some(index) = branch_nav(ui, position, siblings.len())
+                    {
+                        action = Some(BubbleAction::Switch(siblings[index]));
                     }
                     if let (Some(cost), Some(tokens)) = (msg.cost, msg.tokens) {
                         ui.label(
@@ -1041,7 +1280,7 @@ impl MuninnApp {
         });
 
         ui.add_space(18.0);
-        retry
+        action
     }
 
     fn empty_state(&mut self, ui: &mut Ui) {
@@ -1176,6 +1415,40 @@ impl MuninnApp {
     fn composer(&mut self, ui: &mut Ui, ctx: &egui::Context) {
         let mut submit = false;
         let focused = self.active_input == Some(crate::native_input::TARGET_COMPOSER);
+
+        if self.editing.is_some() {
+            let mut cancel = false;
+            egui::Frame::new()
+                .fill(theme::c().accent_soft)
+                .corner_radius(12)
+                .inner_margin(Margin::symmetric(12, 4))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new("Правка сообщения")
+                                .size(10.5)
+                                .color(theme::c().accent)
+                                .strong(),
+                        );
+                        ui.label(
+                            RichText::new("→ новая ветка")
+                                .size(9.5)
+                                .color(theme::c().text_secondary),
+                        );
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if link_button_colored(ui, "Отмена", theme::c().text_secondary)
+                                .clicked()
+                            {
+                                cancel = true;
+                            }
+                        });
+                    });
+                });
+            ui.add_space(6.0);
+            if cancel {
+                self.cancel_edit();
+            }
+        }
 
         egui::Frame::new()
             .fill(theme::c().surface_raised)
@@ -1806,9 +2079,9 @@ impl MuninnApp {
                                     &chat.title
                                 };
                                 let preview = if *index == self.active {
-                                    self.messages.last().map(|m| m.text.as_str()).unwrap_or("")
+                                    self.tip_text()
                                 } else {
-                                    chat.messages.last().map(|m| m.text.as_str()).unwrap_or("")
+                                    Self::chat_preview(chat)
                                 };
                                 query.is_empty()
                                     || title.to_lowercase().contains(&query)
@@ -1827,15 +2100,9 @@ impl MuninnApp {
                                         let active = index == self.active;
                                         let title = if active { &self.title } else { &chat.title };
                                         let preview = if active {
-                                            self.messages
-                                                .last()
-                                                .map(|m| m.text.as_str())
-                                                .unwrap_or("Пустой чат")
+                                            self.tip_text()
                                         } else {
-                                            chat.messages
-                                                .last()
-                                                .map(|m| m.text.as_str())
-                                                .unwrap_or("Пустой чат")
+                                            Self::chat_preview(chat)
                                         };
                                         let time = if active {
                                             "сейчас".to_owned()
@@ -1846,7 +2113,7 @@ impl MuninnApp {
                                         if drawer_chat_row(
                                             ui,
                                             title,
-                                            preview,
+                                            &preview,
                                             &time,
                                             active,
                                             ui.available_width(),
@@ -2483,7 +2750,11 @@ impl MuninnApp {
                 }
 
                 ui.add_space(10.0);
-                info_line(ui, "Сообщений", &self.messages.len().to_string());
+                info_line(
+                    ui,
+                    "Сообщений",
+                    &format!("{} · всего {}", self.path_ids().len(), self.tree.len()),
+                );
                 ui.add_space(4.0);
                 if link_button(ui, "Копировать переписку").clicked() {
                     copy = true;
@@ -2533,7 +2804,7 @@ impl MuninnApp {
 
     fn transcript(&self) -> String {
         let mut out = String::new();
-        for message in &self.messages {
+        for message in self.path_ids().into_iter().filter_map(|id| self.node(id)) {
             if message.text.is_empty() {
                 continue;
             }
@@ -2632,7 +2903,7 @@ impl eframe::App for MuninnApp {
 
         let side = (12.0 + insets.left.max(insets.right)).round() as i8;
         let ctx = ui.ctx().clone();
-        let mut regenerate = false;
+        let mut bubble_action: Option<BubbleAction> = None;
 
         match self.screen {
             Screen::Connect => {
@@ -2672,18 +2943,30 @@ impl eframe::App for MuninnApp {
                     .show(ui, |ui| {
                         let scroll_out = ScrollArea::vertical()
                             .auto_shrink([false, false])
-                            .stick_to_bottom(!self.messages.is_empty())
+                            .stick_to_bottom(self.leaf.is_some())
                             .show(ui, |ui| {
                                 ui.add_space(10.0);
 
-                                if self.messages.is_empty() {
+                                let path = self.path_ids();
+                                let last = path.len().saturating_sub(1);
+
+                                if path.is_empty() {
                                     self.empty_state(ui);
                                 }
 
-                                let last = self.messages.len().saturating_sub(1);
-                                for (index, msg) in self.messages.iter().enumerate() {
-                                    if self.bubble(ui, msg, index == last) {
-                                        regenerate = true;
+                                for (index, id) in path.iter().enumerate() {
+                                    let Some(msg) = self.node(*id) else {
+                                        continue;
+                                    };
+                                    let siblings = self.siblings(*id);
+                                    let position = siblings
+                                        .iter()
+                                        .position(|sibling| sibling == id)
+                                        .unwrap_or(0);
+                                    if let Some(action) =
+                                        self.bubble(ui, msg, index == last, &siblings, position)
+                                    {
+                                        bubble_action = Some(action);
                                     }
                                 }
 
@@ -2704,8 +2987,11 @@ impl eframe::App for MuninnApp {
             }
         }
 
-        if regenerate {
-            self.regenerate(&ctx);
+        match bubble_action {
+            Some(BubbleAction::Regenerate(id)) => self.regenerate(&ctx, id),
+            Some(BubbleAction::Edit(id)) => self.edit_message(id),
+            Some(BubbleAction::Switch(id)) => self.switch_variant(id),
+            None => {}
         }
 
         self.drawer(&ctx, screen, insets);
@@ -2833,6 +3119,61 @@ fn pill_button(ui: &mut Ui, label: &str) -> egui::Response {
         theme::c().on_accent,
     );
     resp
+}
+
+fn branch_arrow(ui: &mut Ui, forward: bool, enabled: bool) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(32.0), Sense::click());
+    if enabled && resp.hovered() {
+        ui.painter()
+            .rect_filled(rect, 9, theme::c().surface_overlay);
+    }
+    let color = if !enabled {
+        theme::c().text_tertiary
+    } else if resp.hovered() {
+        theme::c().text
+    } else {
+        theme::c().text_secondary
+    };
+    let c = rect.center();
+    let dx = if forward { 3.0 } else { -3.0 };
+    let p = ui.painter();
+    p.line_segment(
+        [Pos2::new(c.x - dx, c.y - 5.0), Pos2::new(c.x + dx, c.y)],
+        Stroke::new(1.5, color),
+    );
+    p.line_segment(
+        [Pos2::new(c.x + dx, c.y), Pos2::new(c.x - dx, c.y + 5.0)],
+        Stroke::new(1.5, color),
+    );
+    resp
+}
+
+/// Branch switcher; returns the target position when an arrow is tapped.
+fn branch_nav(ui: &mut Ui, position: usize, total: usize) -> Option<usize> {
+    if total <= 1 {
+        return None;
+    }
+
+    let mut target = None;
+    ui.allocate_ui_with_layout(
+        Vec2::new(92.0, 32.0),
+        Layout::left_to_right(Align::Center),
+        |ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            if branch_arrow(ui, false, position > 0).clicked() && position > 0 {
+                target = Some(position - 1);
+            }
+            ui.label(
+                RichText::new(format!("{}/{}", position + 1, total))
+                    .size(9.5)
+                    .color(theme::c().text_secondary),
+            );
+            if branch_arrow(ui, true, position + 1 < total).clicked() && position + 1 < total {
+                target = Some(position + 1);
+            }
+        },
+    );
+    target
 }
 
 fn close_button(ui: &mut Ui) -> egui::Response {
@@ -3395,15 +3736,92 @@ fn link_button(ui: &mut Ui, label: &str) -> egui::Response {
 // Helpers
 // ----------------------------------------------------------------------
 
-fn placeholder() -> Message {
-    Message {
-        role: Role::Assistant,
-        text: String::new(),
-        reasoning: None,
-        cost: None,
-        tokens: None,
-        streaming: true,
-        error: false,
+fn tree_path(nodes: &[Message], leaf: Option<u64>) -> Vec<u64> {
+    let mut path = Vec::new();
+    let mut current = leaf;
+
+    for _ in 0..=nodes.len() {
+        let Some(id) = current else {
+            break;
+        };
+        let Some(node) = nodes.iter().find(|node| node.id == id) else {
+            break;
+        };
+        path.push(id);
+        current = node.parent;
+    }
+
+    path.reverse();
+    path
+}
+
+fn tree_siblings(nodes: &[Message], id: u64) -> Vec<u64> {
+    let Some(node) = nodes.iter().find(|node| node.id == id) else {
+        return Vec::new();
+    };
+
+    nodes
+        .iter()
+        .filter(|sibling| sibling.parent == node.parent)
+        .map(|sibling| sibling.id)
+        .collect()
+}
+
+fn tree_latest_leaf(nodes: &[Message], id: u64) -> u64 {
+    let mut current = id;
+    for _ in 0..=nodes.len() {
+        match nodes.iter().rev().find(|node| node.parent == Some(current)) {
+            Some(child) => current = child.id,
+            None => break,
+        }
+    }
+    current
+}
+
+/// Turn the pre-tree linear history into a chain of nodes.
+fn migrate_chat(chat: &mut ChatSnapshot) {
+    if chat.nodes.is_empty() && !chat.messages.is_empty() {
+        let legacy = std::mem::take(&mut chat.messages);
+        let mut parent = None;
+
+        for mut message in legacy {
+            let mut id = next_id();
+            while chat.nodes.iter().any(|node| node.id == id) {
+                id = id.wrapping_add(1);
+            }
+            message.id = id;
+            message.parent = parent;
+            parent = Some(id);
+            chat.nodes.push(message);
+        }
+
+        chat.leaf = parent;
+    }
+
+    chat.messages.clear();
+    for node in &mut chat.nodes {
+        node.streaming = false;
+    }
+    if chat.leaf.is_none() || !chat.nodes.iter().any(|node| Some(node.id) == chat.leaf) {
+        chat.leaf = chat.nodes.last().map(|node| node.id);
+    }
+
+    // An interrupted stream can leave an empty assistant tail; drop it.
+    while let Some(leaf) = chat.leaf {
+        let Some(node) = chat.nodes.iter().find(|node| node.id == leaf) else {
+            chat.leaf = None;
+            break;
+        };
+        let empty = node.role == Role::Assistant
+            && node.text.is_empty()
+            && node.reasoning.is_none()
+            && !node.error;
+        if !empty || chat.nodes.iter().any(|child| child.parent == Some(leaf)) {
+            break;
+        }
+        let parent = node.parent;
+        chat.nodes.retain(|node| node.id != leaf);
+        chat.leaf = parent;
     }
 }
 
@@ -3597,4 +4015,110 @@ fn next_id() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_nanos() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tree_tests {
+    use super::*;
+
+    fn node(id: u64, parent: Option<u64>, role: Role, text: &str) -> Message {
+        Message {
+            id,
+            parent,
+            role,
+            text: text.to_owned(),
+            reasoning: None,
+            cost: None,
+            tokens: None,
+            streaming: false,
+            error: false,
+        }
+    }
+
+    fn chat(nodes: Vec<Message>, leaf: Option<u64>) -> ChatSnapshot {
+        ChatSnapshot {
+            id: 1,
+            title: "test".into(),
+            model: "test/model".into(),
+            cost: 0.0,
+            tokens: 0,
+            updated_at: 0,
+            messages: Vec::new(),
+            nodes,
+            leaf,
+            persona_id: String::new(),
+            system_prompt: String::new(),
+        }
+    }
+
+    #[test]
+    fn path_walks_to_root() {
+        let nodes = vec![
+            node(1, None, Role::User, "u1"),
+            node(2, Some(1), Role::Assistant, "a1"),
+            node(3, Some(2), Role::User, "u2"),
+            node(4, Some(3), Role::Assistant, "a2"),
+        ];
+        assert_eq!(tree_path(&nodes, Some(4)), vec![1, 2, 3, 4]);
+        assert_eq!(tree_path(&nodes, Some(2)), vec![1, 2]);
+        assert!(tree_path(&nodes, None).is_empty());
+        assert!(tree_path(&nodes, Some(99)).is_empty());
+    }
+
+    #[test]
+    fn siblings_share_a_parent() {
+        let nodes = vec![
+            node(1, None, Role::User, "u1"),
+            node(2, Some(1), Role::Assistant, "a1"),
+            node(3, Some(1), Role::Assistant, "a1'"),
+            node(4, None, Role::User, "u1'"),
+        ];
+        assert_eq!(tree_siblings(&nodes, 2), vec![2, 3]);
+        assert_eq!(tree_siblings(&nodes, 1), vec![1, 4]);
+        assert!(tree_siblings(&nodes, 99).is_empty());
+    }
+
+    #[test]
+    fn latest_leaf_takes_the_newest_descendant() {
+        let nodes = vec![
+            node(1, None, Role::User, "u1"),
+            node(2, Some(1), Role::Assistant, "a1"),
+            node(3, Some(2), Role::User, "u2"),
+            node(4, Some(1), Role::Assistant, "a1'"),
+            node(5, Some(4), Role::User, "u2'"),
+        ];
+        assert_eq!(tree_latest_leaf(&nodes, 2), 3);
+        assert_eq!(tree_latest_leaf(&nodes, 4), 5);
+        assert_eq!(tree_latest_leaf(&nodes, 5), 5);
+    }
+
+    #[test]
+    fn legacy_history_migrates_to_a_chain() {
+        let mut snapshot = chat(Vec::new(), None);
+        snapshot.messages = vec![
+            node(0, None, Role::User, "u1"),
+            node(0, None, Role::Assistant, "a1"),
+            node(0, None, Role::User, "u2"),
+        ];
+        migrate_chat(&mut snapshot);
+
+        assert!(snapshot.messages.is_empty());
+        assert_eq!(snapshot.nodes.len(), 3);
+        assert!(snapshot.nodes.iter().all(|node| node.id != 0));
+        assert_eq!(snapshot.nodes[0].parent, None);
+        assert_eq!(snapshot.nodes[1].parent, Some(snapshot.nodes[0].id));
+        assert_eq!(snapshot.nodes[2].parent, Some(snapshot.nodes[1].id));
+        assert_eq!(snapshot.leaf, Some(snapshot.nodes[2].id));
+    }
+
+    #[test]
+    fn migrate_repairs_a_missing_leaf() {
+        let nodes = vec![
+            node(1, None, Role::User, "u1"),
+            node(2, Some(1), Role::Assistant, "a1"),
+        ];
+        let mut snapshot = chat(nodes, Some(99));
+        migrate_chat(&mut snapshot);
+        assert_eq!(snapshot.leaf, Some(2));
+    }
 }

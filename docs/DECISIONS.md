@@ -51,7 +51,12 @@ Locked decisions for Muninn. Change only with a written note here.
 - Everything encrypted: SQLCipher for the database, AES-256-GCM for files.
   Key wrapped by Android Keystore. System biometric/device-credential lock.
 - No recovery if the Keystore key is lost; encrypted export is the backup path.
-- Conversation tree with branches; edits and regenerations create children.
+- Conversation tree with branches. Every chat stores a flat node list plus a
+  current leaf; the visible thread is the root-to-leaf path. Editing a user
+  turn creates a sibling, regenerating an answer creates another sibling;
+  both stay reachable with `‹ n/m ›`. Failed attempts are retried in place
+  instead of becoming variants. Legacy linear chats are migrated to a chain
+  on load.
 - Raw request/response JSON is stored for the inspector and reproducibility.
 - Embeddings are used only for semantic chat search; FTS5 remains the base.
 - `FLAG_SECURE` on by default; temporary opt-out in settings.
