@@ -5,6 +5,7 @@
 
 mod app;
 mod markdown;
+mod native_input;
 mod platform;
 mod runtime;
 mod secrets;

@@ -39,6 +39,13 @@ android {
         }
     }
 
+    sourceSets {
+        getByName("main") {
+            // Share the Rust crate's assets (Inter, emoji) with the native input overlay.
+            assets.srcDirs("../../assets")
+        }
+    }
+
     buildFeatures {
         buildConfig = true
     }

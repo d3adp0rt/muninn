@@ -1,5 +1,18 @@
 //! Android-specific platform queries that eframe does not expose.
 
+static EGUI_CONTEXT: std::sync::OnceLock<egui::Context> = std::sync::OnceLock::new();
+
+pub fn set_egui_context(ctx: egui::Context) {
+    let _ = EGUI_CONTEXT.set(ctx);
+}
+
+#[cfg(target_os = "android")]
+fn wake_ui() {
+    if let Some(ctx) = EGUI_CONTEXT.get() {
+        ctx.request_repaint();
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Insets {
     pub top: f32,
@@ -106,6 +119,7 @@ mod android {
         BOTTOM.store(bottom, Relaxed);
         LEFT.store(left, Relaxed);
         RIGHT.store(right, Relaxed);
+        super::wake_ui();
     }
 
     /// Configure the soft keyboard for the field that just gained focus.
@@ -157,6 +171,19 @@ mod android {
         };
         app.set_text_input_state(state);
     }
+}
+
+#[cfg(target_os = "android")]
+pub fn with_activity<R>(
+    f: impl FnOnce(&mut jni::JNIEnv<'_>, &jni::objects::JObject<'_>) -> R,
+) -> Option<R> {
+    use jni::JavaVM;
+
+    let ctx = ndk_context::android_context();
+    let vm = unsafe { JavaVM::from_raw(ctx.vm().cast()) }.ok()?;
+    let mut env = vm.attach_current_thread().ok()?;
+    let activity = android::activity()?;
+    Some(f(&mut env, activity.as_obj()))
 }
 
 #[cfg(target_os = "android")]

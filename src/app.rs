@@ -34,11 +34,9 @@ pub struct MuninnApp {
     base_ime: String,
     key_ime: String,
     search_ime: String,
-    composer_ime: String,
     base_sel: (usize, usize),
     key_sel: (usize, usize),
     search_sel: (usize, usize),
-    composer_sel: (usize, usize),
     connecting: bool,
     error: Option<String>,
 
@@ -61,7 +59,9 @@ pub struct MuninnApp {
     title: String,
     messages: Vec<Message>,
     draft: String,
-    ime_focused: bool,
+    native_active: bool,
+    composer_rect: Rect,
+    repaint_ticks: u8,
     deep_think: bool,
     web: bool,
     streaming: bool,
@@ -171,6 +171,7 @@ enum UiEvent {
 impl MuninnApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let _ = crate::runtime::rt();
+        crate::platform::set_egui_context(cc.egui_ctx.clone());
 
         let (tx, rx) = channel();
 
@@ -183,11 +184,9 @@ impl MuninnApp {
             base_ime: String::new(),
             key_ime: String::new(),
             search_ime: String::new(),
-            composer_ime: String::new(),
             base_sel: (0, 0),
             key_sel: (0, 0),
             search_sel: (0, 0),
-            composer_sel: (0, 0),
             connecting: false,
             error: None,
             models: Vec::new(),
@@ -207,7 +206,9 @@ impl MuninnApp {
             title: "Новый чат".to_owned(),
             messages: Vec::new(),
             draft: String::new(),
-            ime_focused: false,
+            native_active: false,
+            composer_rect: Rect::NOTHING,
+            repaint_ticks: 0,
             deep_think: false,
             web: false,
             streaming: false,
@@ -357,6 +358,8 @@ impl MuninnApp {
             return;
         }
 
+        // Pull the last native text event before locking the message.
+        self.drain_native();
         let text = self.draft.trim().to_owned();
         if text.is_empty() {
             return;
@@ -412,10 +415,9 @@ impl MuninnApp {
             error: false,
         });
 
+        self.stop_native();
         self.draft.clear();
-        self.composer_ime.clear();
         self.save_current();
-        crate::platform::set_ime_text("", 0, 0);
         hide_keyboard(ctx);
         self.streaming = true;
 
@@ -552,6 +554,7 @@ impl MuninnApp {
     // ------------------------------------------------------------------
 
     fn open_sheet(&mut self, ctx: &egui::Context, sheet: Sheet) {
+        self.stop_native();
         self.sheet = sheet;
         self.model_search_focus = false;
         self.drawer_open = false;
@@ -565,8 +568,10 @@ impl MuninnApp {
     }
 
     fn new_chat(&mut self, ctx: &egui::Context) {
+        self.stop_native();
         self.stop();
         self.save_current();
+        self.draft.clear();
         self.chats.push(self.empty_snapshot());
         self.active = self.chats.len() - 1;
         self.load_active();
@@ -576,11 +581,13 @@ impl MuninnApp {
     }
 
     fn change_key(&mut self, ctx: &egui::Context) {
+        self.stop_native();
         self.stop();
         self.save_current();
         crate::secrets::clear();
         self.screen = Screen::Connect;
         self.api_key.clear();
+        self.draft.clear();
         self.base_url = OPENROUTER_BASE.to_owned();
         self.connecting = false;
         self.models.clear();
@@ -698,9 +705,11 @@ impl MuninnApp {
         if index >= self.chats.len() || index == self.active {
             return;
         }
+        self.stop_native();
         self.stop();
         self.save_current();
         self.active = index;
+        self.draft.clear();
         self.load_active();
         self.sheet = Sheet::None;
         hide_keyboard(ctx);
@@ -716,6 +725,7 @@ impl MuninnApp {
 
         ui.horizontal(|ui| {
             if menu_button(ui).clicked() {
+                self.stop_native();
                 self.drawer_open = true;
                 self.chat_search_focus = false;
                 hide_keyboard(&ctx);
@@ -886,11 +896,14 @@ impl MuninnApp {
     }
 
     fn empty_state(&mut self, ui: &mut Ui) {
-        let top = ((ui.available_height() - 320.0) * 0.22).clamp(12.0, 140.0);
+        let compact = ui.available_height() < 430.0;
+        let top = ((ui.available_height() - if compact { 170.0 } else { 320.0 }) * 0.22)
+            .clamp(12.0, 140.0);
         ui.add_space(top);
 
         ui.vertical_centered(|ui| {
-            let (rect, _) = ui.allocate_exact_size(Vec2::splat(56.0), Sense::hover());
+            let size = if compact { 46.0 } else { 56.0 };
+            let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
             ui.painter()
                 .circle_filled(rect.center(), 28.0, theme::c().accent_soft);
             ui.painter()
@@ -899,19 +912,27 @@ impl MuninnApp {
                 rect.center(),
                 Align2::CENTER_CENTER,
                 "M",
-                FontId::proportional(22.0),
+                FontId::proportional(if compact { 18.0 } else { 22.0 }),
                 theme::c().accent,
             );
 
-            ui.add_space(12.0);
-            ui.label(RichText::new("Чем помочь?").size(26.0).strong());
-            ui.add_space(6.0);
+            ui.add_space(10.0);
+            ui.label(
+                RichText::new("Чем помочь?")
+                    .size(if compact { 22.0 } else { 26.0 })
+                    .strong(),
+            );
+            ui.add_space(4.0);
             ui.label(
                 RichText::new("История и файлы остаются на устройстве.")
-                    .size(13.0)
+                    .size(if compact { 11.5 } else { 13.0 })
                     .color(theme::c().text_secondary),
             );
         });
+
+        if compact {
+            return;
+        }
 
         ui.add_space(26.0);
 
@@ -941,11 +962,57 @@ impl MuninnApp {
         }
     }
 
+    fn start_native(&mut self, ctx: &egui::Context) {
+        if self.composer_rect == Rect::NOTHING {
+            return;
+        }
+        if crate::native_input::show(
+            crate::native_input::TARGET_COMPOSER,
+            self.composer_rect,
+            &self.draft,
+            "Сообщение…",
+            true,
+            false,
+            ctx.pixels_per_point(),
+        ) {
+            self.native_active = true;
+            self.repaint_ticks = 30;
+        }
+    }
+
+    fn stop_native(&mut self) {
+        if self.native_active {
+            crate::native_input::hide();
+            self.native_active = false;
+        }
+        self.repaint_ticks = 30;
+    }
+
+    fn drain_native(&mut self) {
+        for event in crate::native_input::poll() {
+            match event {
+                crate::native_input::Event::Text {
+                    target: crate::native_input::TARGET_COMPOSER,
+                    text,
+                } => {
+                    self.draft = text;
+                }
+                crate::native_input::Event::Focus {
+                    target: crate::native_input::TARGET_COMPOSER,
+                    focused: false,
+                } => {
+                    self.native_active = false;
+                    crate::native_input::hide();
+                    self.repaint_ticks = 30;
+                }
+                _ => {}
+            }
+        }
+    }
+
     fn composer(&mut self, ui: &mut Ui, ctx: &egui::Context) {
         let mut submit = false;
-
-        let composer_id = Id::unique("composer");
-        let focused = ui.memory(|m| m.focused() == Some(composer_id));
+        let focused = self.native_active;
 
         egui::Frame::new()
             .fill(theme::c().surface_raised)
@@ -960,31 +1027,38 @@ impl MuninnApp {
             ))
             .inner_margin(Margin::symmetric(10, 8))
             .show(ui, |ui| {
-                let edit = egui::TextEdit::multiline(&mut self.draft)
-                    .id(composer_id)
-                    .hint_text("Сообщение…")
-                    .desired_rows(1)
-                    .desired_width(f32::INFINITY)
-                    .font(FontId::proportional(14.5))
-                    .frame(egui::Frame::new())
-                    .margin(Margin::symmetric(4, 6));
+                let (rect, resp) =
+                    ui.allocate_exact_size(Vec2::new(ui.available_width(), 44.0), Sense::click());
+                self.composer_rect = rect;
 
-                let resp = ui.add_sized([ui.available_width(), 38.0], edit);
-                ime_sync(
-                    ui,
-                    &resp,
-                    &mut self.draft,
-                    &mut self.ime_focused,
-                    &mut self.composer_ime,
-                    &mut self.composer_sel,
-                    true,
-                    false,
-                );
+                if self.native_active {
+                    // The native EditText is above the SurfaceView and owns
+                    // text, caret and selection. Keep it glued to the layout.
+                    crate::native_input::set_rect(rect, ctx.pixels_per_point());
+                } else {
+                    let painter = ui.painter().with_clip_rect(rect);
+                    let origin = Pos2::new(rect.left() + 4.0, rect.top() + 10.0);
+                    if self.draft.is_empty() {
+                        painter.text(
+                            origin,
+                            Align2::LEFT_TOP,
+                            "Сообщение…",
+                            FontId::proportional(15.0),
+                            theme::c().text_tertiary,
+                        );
+                    } else {
+                        let galley = painter.layout(
+                            self.draft.clone(),
+                            FontId::proportional(15.0),
+                            theme::c().text,
+                            rect.width() - 8.0,
+                        );
+                        painter.galley(origin, galley, theme::c().text);
+                    }
+                }
 
-                if resp.has_focus()
-                    && ctx.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift)
-                {
-                    submit = true;
+                if resp.clicked() && !self.native_active {
+                    self.start_native(ctx);
                 }
 
                 ui.add_space(2.0);
@@ -1002,6 +1076,7 @@ impl MuninnApp {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if self.streaming {
                             if stop_button(ui).clicked() {
+                                self.stop_native();
                                 self.stop();
                             }
                         } else if send_button(ui, !self.draft.trim().is_empty()).clicked() {
@@ -1012,6 +1087,7 @@ impl MuninnApp {
             });
 
         if submit && !self.streaming {
+            self.stop_native();
             self.send(ctx);
         }
     }
@@ -1711,16 +1787,37 @@ impl MuninnApp {
 impl eframe::App for MuninnApp {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         self.drain_events(ui.ctx());
+        self.drain_native();
+
+        if self.native_active {
+            let clicked_outside = ui.ctx().input(|i| {
+                i.pointer.any_click()
+                    && i.pointer
+                        .interact_pos()
+                        .is_some_and(|pos| !self.composer_rect.contains(pos))
+            });
+            if clicked_outside {
+                self.stop_native();
+            }
+        }
 
         if crate::platform::take_back_requested() {
-            if self.drawer_open {
+            if self.native_active {
+                self.stop_native();
+            } else if self.drawer_open {
                 self.drawer_open = false;
                 hide_keyboard(ui.ctx());
             } else if self.sheet != Sheet::None {
                 self.close_sheet(ui.ctx());
             }
         }
-        crate::platform::set_back_handled(self.drawer_open || self.sheet != Sheet::None);
+        crate::platform::set_back_handled(
+            self.native_active || self.drawer_open || self.sheet != Sheet::None,
+        );
+
+        if self.screen == Screen::Connect {
+            self.stop_native();
+        }
 
         let screen = ui.max_rect();
         let insets = crate::platform::system_insets(ui);
@@ -1782,7 +1879,7 @@ impl eframe::App for MuninnApp {
                     .show(ui, |ui| {
                         ScrollArea::vertical()
                             .auto_shrink([false, false])
-                            .stick_to_bottom(true)
+                            .stick_to_bottom(!self.messages.is_empty())
                             .show(ui, |ui| {
                                 ui.add_space(10.0);
 
@@ -1802,6 +1899,10 @@ impl eframe::App for MuninnApp {
 
         self.drawer(&ctx, screen, insets);
         self.sheets(&ctx, screen, insets);
+
+        if self.native_active {
+            ui.ctx().request_repaint_after(Duration::from_millis(50));
+        }
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
