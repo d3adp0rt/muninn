@@ -17,6 +17,12 @@ pub const TARGET_MODEL_SEARCH: i32 = 1;
 pub const TARGET_CHAT_SEARCH: i32 = 2;
 pub const TARGET_BASE_URL: i32 = 3;
 pub const TARGET_API_KEY: i32 = 4;
+pub const TARGET_PERSONA_NAME: i32 = 5;
+pub const TARGET_PERSONA_DESCRIPTION: i32 = 6;
+pub const TARGET_PERSONA_PROMPT: i32 = 7;
+pub const TARGET_CHAT_PROMPT: i32 = 8;
+pub const TARGET_GLOBAL_PROMPT: i32 = 9;
+pub const TARGET_CHAT_TITLE: i32 = 10;
 
 #[derive(Debug)]
 #[allow(dead_code)]

@@ -139,6 +139,32 @@ pub fn with_activity<R>(
 pub use android::{init_activity, set_back_handled, take_back_requested};
 
 #[cfg(target_os = "android")]
+pub fn timezone_id() -> Option<String> {
+    use jni::JavaVM;
+
+    let ctx = ndk_context::android_context();
+    let vm = unsafe { JavaVM::from_raw(ctx.vm().cast()) }.ok()?;
+    let mut env = vm.attach_current_thread().ok()?;
+    let activity = android::activity()?.as_obj();
+
+    let value = env
+        .call_method(activity, "muninnTimezone", "()Ljava/lang/String;", &[])
+        .ok()?;
+    let obj = value.l().ok()?;
+    if obj.is_null() {
+        return None;
+    }
+    let raw = jni::objects::JString::from(obj);
+    let text = env.get_string(&raw).ok()?;
+    Some(text.into())
+}
+
+#[cfg(not(target_os = "android"))]
+pub fn timezone_id() -> Option<String> {
+    None
+}
+
+#[cfg(target_os = "android")]
 pub fn clipboard_get() -> Option<String> {
     use jni::JavaVM;
 

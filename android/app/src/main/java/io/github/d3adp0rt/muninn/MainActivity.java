@@ -10,6 +10,7 @@ import android.os.Bundle;
 import android.text.Editable;
 import android.text.InputType;
 import android.text.TextWatcher;
+import android.text.method.ScrollingMovementMethod;
 import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.WindowManager;
@@ -107,7 +108,8 @@ public class MainActivity extends GameActivity {
 
             @Override
             public void afterTextChanged(Editable s) {
-                if (!inputSuppress && inputTarget >= 0) {
+                if (!inputSuppress && inputTarget >= 0 && inputView != null
+                        && inputView.isFocused()) {
                     nativeInputText(inputTarget, s.toString());
                 }
             }
@@ -159,8 +161,6 @@ public class MainActivity extends GameActivity {
             boolean multiline = "1".equals(p[10]);
             boolean password = "1".equals(p[11]);
 
-            inputTarget = target;
-
             FrameLayout.LayoutParams params =
                     (FrameLayout.LayoutParams) inputView.getLayoutParams();
             params.leftMargin = x;
@@ -169,6 +169,19 @@ public class MainActivity extends GameActivity {
             params.height = h;
             params.gravity = Gravity.TOP | Gravity.START;
             inputView.setLayoutParams(params);
+
+            // A multi-pass egui frame can ask to show the same field twice;
+            // keep the text and caret untouched in that case.
+            if (target == inputTarget
+                    && inputView.getVisibility() == View.VISIBLE
+                    && inputView.isFocused()) {
+                return;
+            }
+
+            // Configuration below can emit text callbacks; the field is not
+            // live yet, so keep them from clobbering Rust state.
+            inputSuppress = true;
+            inputTarget = target;
 
             int type = InputType.TYPE_CLASS_TEXT;
             if (multiline) {
@@ -181,6 +194,9 @@ public class MainActivity extends GameActivity {
 
             inputView.setTextSize(TypedValue.COMPLEX_UNIT_SP, textSize);
             inputView.setInputType(type);
+            inputView.setMovementMethod(
+                    multiline ? new ScrollingMovementMethod() : null);
+            inputView.setVerticalScrollBarEnabled(multiline);
             inputView.setSingleLine(!multiline);
             inputView.setMaxLines(multiline ? 5 : 1);
             inputView.setTextColor(textColor);
@@ -192,17 +208,16 @@ public class MainActivity extends GameActivity {
             } catch (Exception ignored) {
             }
 
-            inputSuppress = true;
             inputView.setText(text);
             int len = inputView.getText().length();
             int start = selStart < 0 ? len : clamp(selStart, 0, len);
             int end = selEnd < 0 ? len : clamp(selEnd, 0, len);
             inputView.setSelection(start, end);
-            inputSuppress = false;
 
             inputView.setVisibility(View.VISIBLE);
             inputView.bringToFront();
             inputView.requestFocus();
+            inputSuppress = false;
             inputView.postDelayed(() -> {
                 if (imeManager != null) {
                     imeManager.showSoftInput(inputView, InputMethodManager.SHOW_IMPLICIT);
@@ -327,6 +342,11 @@ public class MainActivity extends GameActivity {
             controller.setAppearanceLightStatusBars(light);
             controller.setAppearanceLightNavigationBars(light);
         });
+    }
+
+    /** IANA id of the device time zone, used to expand prompt variables. */
+    public String muninnTimezone() {
+        return java.util.TimeZone.getDefault().getID();
     }
 
     /** Read the primary clipboard item as text (null if empty). */

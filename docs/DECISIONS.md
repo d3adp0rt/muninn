@@ -10,6 +10,28 @@ Locked decisions for Muninn. Change only with a written note here.
   Java/Kotlin in the app.
 - No desktop app; a `desktop` feature exists only for local UI preview.
 
+## UI
+
+- egui for layout; all text editing goes through one native Android
+  `EditText` overlay (JNI). The IME owns caret, selection, long-press delete,
+  emoji and clipboard; Rust mirrors the text and paints everything else.
+- Bottom sheets only, never floating windows. Touch targets are at least
+  44 dp. Colours come from design tokens, not ad-hoc constants.
+- Text fields are shown twice: the drawn copy when idle, the native view when
+  focused. The native view is the single source of truth while typing.
+
+## Prompts
+
+- Three visible layers: global prompt -> persona -> per-chat prompt. They are
+  joined with blank lines and expanded at request time (`{{date}}`, `{{time}}`,
+  `{{weekday}}`, `{{datetime}}`, `{{tz}}`, `{{model}}`, `{{chat}}`,
+  `{{persona}}`).
+- Personas are behaviour presets, not characters. Built-ins ship once, are
+  editable, and can be restored; a missing persona id falls back to no persona
+  layer. New chats inherit the persona of the previous chat.
+- The app never injects hidden instructions. The assembled system prompt is
+  shown in the UI before sending.
+
 ## API
 
 - Chat Completions is the primary API. Responses API is used only where a

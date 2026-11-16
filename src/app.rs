@@ -19,6 +19,7 @@ use crate::api::{
     ChatRequest, Client, ClientConfig, ModelInfo, RequestMessage, Role, StreamEvent, Usage,
 };
 use crate::platform::Insets;
+use crate::prompt::{self, Persona};
 use crate::theme;
 use serde::{Deserialize, Serialize};
 
@@ -44,12 +45,24 @@ pub struct MuninnApp {
     drawer_open: bool,
     chat_query: String,
 
+    personas: Vec<Persona>,
+    persona_id: String,
+    chat_prompt: String,
+    global_prompt: String,
+    persona_draft: Option<PersonaDraft>,
+    persona_scroll: bool,
+    confirm_persona_delete: bool,
+    confirm_chat_delete: bool,
+
     title: String,
     messages: Vec<Message>,
     draft: String,
     active_input: Option<i32>,
     active_rect: Rect,
     repaint_ticks: u8,
+    scroll_to_bottom: bool,
+    focus_composer: bool,
+    last_inset_bottom: f32,
     deep_think: bool,
     web: bool,
     streaming: bool,
@@ -72,6 +85,39 @@ enum Sheet {
     None,
     Models,
     Settings,
+    Personas,
+    PersonaEditor,
+    Prompt,
+    ChatInfo,
+}
+
+/// Scratch copy of a persona while the editor sheet is open.
+struct PersonaDraft {
+    /// `None` while creating a new persona.
+    id: Option<String>,
+    name: String,
+    description: String,
+    prompt: String,
+}
+
+impl PersonaDraft {
+    fn from_persona(persona: &Persona) -> Self {
+        Self {
+            id: Some(persona.id.clone()),
+            name: persona.name.clone(),
+            description: persona.description.clone(),
+            prompt: persona.prompt.clone(),
+        }
+    }
+
+    fn new() -> Self {
+        Self {
+            id: None,
+            name: String::new(),
+            description: String::new(),
+            prompt: String::new(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -136,6 +182,11 @@ struct ChatSnapshot {
     tokens: u64,
     updated_at: u64,
     messages: Vec<Message>,
+    /// Empty string means "no persona"; old chats load without one.
+    #[serde(default)]
+    persona_id: String,
+    #[serde(default)]
+    system_prompt: String,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -144,6 +195,10 @@ struct Workspace {
     active: usize,
     #[serde(default)]
     theme: theme::Mode,
+    #[serde(default)]
+    personas: Vec<Persona>,
+    #[serde(default)]
+    global_prompt: String,
 }
 
 enum UiEvent {
@@ -179,12 +234,23 @@ impl MuninnApp {
             theme_mode: theme::Mode::Dark,
             drawer_open: false,
             chat_query: String::new(),
+            personas: prompt::builtins(),
+            persona_id: prompt::DEFAULT_PERSONA.to_owned(),
+            chat_prompt: String::new(),
+            global_prompt: String::new(),
+            persona_draft: None,
+            persona_scroll: true,
+            confirm_persona_delete: false,
+            confirm_chat_delete: false,
             title: "Новый чат".to_owned(),
             messages: Vec::new(),
             draft: String::new(),
             active_input: None,
             active_rect: Rect::NOTHING,
             repaint_ticks: 0,
+            scroll_to_bottom: true,
+            focus_composer: false,
+            last_inset_bottom: 0.0,
             deep_think: false,
             web: false,
             streaming: false,
@@ -342,7 +408,7 @@ impl MuninnApp {
             return;
         }
 
-        if self.title == "Новый чат" {
+        if self.title.trim().is_empty() || self.title == "Новый чат" {
             self.title = text.chars().take(48).collect();
         }
 
@@ -356,14 +422,62 @@ impl MuninnApp {
             error: false,
         });
 
-        // The user turn must be part of the request; build history after
-        // pushing it, and skip error bubbles.
-        let history: Vec<RequestMessage> = self
+        let request = self.build_request();
+
+        self.messages.push(placeholder());
+        self.scroll_to_bottom = true;
+        self.stop_native();
+        self.draft.clear();
+        self.save_current();
+        hide_keyboard(ctx);
+        self.streaming = true;
+        self.launch(ctx, request);
+    }
+
+    /// Drop the last answer and ask the model again with the same history.
+    fn regenerate(&mut self, ctx: &egui::Context) {
+        if self.streaming {
+            return;
+        }
+
+        self.stop_native();
+        while self
+            .messages
+            .last()
+            .is_some_and(|message| message.role == Role::Assistant)
+        {
+            self.messages.pop();
+        }
+
+        if !self
             .messages
             .iter()
-            .filter(|m| !m.error && !m.text.is_empty())
-            .map(|m| RequestMessage::text(m.role, m.text.clone()))
+            .any(|message| message.role == Role::User)
+        {
+            return;
+        }
+
+        let request = self.build_request();
+        self.messages.push(placeholder());
+        self.scroll_to_bottom = true;
+        self.save_current();
+        hide_keyboard(ctx);
+        self.streaming = true;
+        self.launch(ctx, request);
+    }
+
+    /// Assemble the request: system layers, then the visible conversation.
+    fn build_request(&self) -> ChatRequest {
+        let mut history: Vec<RequestMessage> = self
+            .messages
+            .iter()
+            .filter(|message| !message.error && !message.text.is_empty())
+            .map(|message| RequestMessage::text(message.role, message.text.clone()))
             .collect();
+
+        if let Some(system) = self.system_prompt() {
+            history.insert(0, RequestMessage::system(system));
+        }
 
         let mut request = ChatRequest::new(self.model.clone(), history);
         request.stream = Some(true);
@@ -382,22 +496,25 @@ impl MuninnApp {
             }]);
         }
 
-        self.messages.push(Message {
-            role: Role::Assistant,
-            text: String::new(),
-            reasoning: None,
-            cost: None,
-            tokens: None,
-            streaming: true,
-            error: false,
-        });
+        request
+    }
 
-        self.stop_native();
-        self.draft.clear();
-        self.save_current();
-        hide_keyboard(ctx);
-        self.streaming = true;
+    fn system_prompt(&self) -> Option<String> {
+        let persona = self.active_persona();
 
+        prompt::compose(
+            &self.global_prompt,
+            persona.map(|persona| persona.prompt.as_str()),
+            &self.chat_prompt,
+            &prompt::Vars {
+                model: &self.model,
+                chat: &self.title,
+                persona: persona.map(|persona| persona.name.as_str()).unwrap_or(""),
+            },
+        )
+    }
+
+    fn launch(&mut self, ctx: &egui::Context, request: ChatRequest) {
         let client = match Client::new(ClientConfig {
             base_url: self.base_url.trim().trim_end_matches('/').to_owned(),
             api_key: self.api_key.trim().to_owned(),
@@ -506,6 +623,7 @@ impl MuninnApp {
                 }
                 UiEvent::Finished => {
                     self.streaming = false;
+                    self.scroll_to_bottom = true;
                     self.stream_task = None;
                     if let Some(msg) = self.messages.last_mut() {
                         msg.streaming = false;
@@ -532,15 +650,39 @@ impl MuninnApp {
 
     fn open_sheet(&mut self, ctx: &egui::Context, sheet: Sheet) {
         self.stop_native();
+        self.flush_sheet_edits();
         self.sheet = sheet;
+        self.persona_draft = None;
+        if sheet == Sheet::Personas {
+            self.persona_scroll = true;
+        }
+        self.confirm_persona_delete = false;
+        self.confirm_chat_delete = false;
         self.drawer_open = false;
         hide_keyboard(ctx);
     }
 
     fn close_sheet(&mut self, ctx: &egui::Context) {
         self.stop_native();
+        self.flush_sheet_edits();
         self.sheet = Sheet::None;
+        self.persona_draft = None;
+        self.confirm_persona_delete = false;
+        self.confirm_chat_delete = false;
         hide_keyboard(ctx);
+    }
+
+    /// Persist edits made in sheets that write directly into chat state.
+    fn flush_sheet_edits(&mut self) {
+        if matches!(
+            self.sheet,
+            Sheet::Models | Sheet::Prompt | Sheet::ChatInfo | Sheet::Personas
+        ) {
+            if self.title.trim().is_empty() {
+                self.title = "Новый чат".to_owned();
+            }
+            self.save_current();
+        }
     }
 
     fn new_chat(&mut self, ctx: &egui::Context) {
@@ -551,6 +693,7 @@ impl MuninnApp {
         self.chats.push(self.empty_snapshot());
         self.active = self.chats.len() - 1;
         self.load_active();
+        self.focus_composer = true;
         self.sheet = Sheet::None;
         hide_keyboard(ctx);
         self.persist();
@@ -587,6 +730,10 @@ impl MuninnApp {
             self.chats = workspace.chats;
             self.active = workspace.active;
             self.theme_mode = workspace.theme;
+            if !workspace.personas.is_empty() {
+                self.personas = workspace.personas;
+            }
+            self.global_prompt = workspace.global_prompt;
         }
 
         if self.chats.is_empty() {
@@ -611,6 +758,8 @@ impl MuninnApp {
             tokens: 0,
             updated_at: now_secs(),
             messages: Vec::new(),
+            persona_id: self.persona_id.clone(),
+            system_prompt: String::new(),
         }
     }
 
@@ -627,6 +776,9 @@ impl MuninnApp {
         };
         self.chat_cost = chat.cost;
         self.chat_tokens = chat.tokens;
+        self.scroll_to_bottom = true;
+        self.persona_id = chat.persona_id.clone();
+        self.chat_prompt = chat.system_prompt.clone();
         self.messages = chat.messages.clone();
 
         for message in &mut self.messages {
@@ -661,6 +813,8 @@ impl MuninnApp {
             tokens: self.chat_tokens,
             updated_at: now_secs(),
             messages: self.messages.clone(),
+            persona_id: self.persona_id.clone(),
+            system_prompt: self.chat_prompt.clone(),
         };
         self.chats[self.active] = snapshot;
         self.persist();
@@ -671,6 +825,8 @@ impl MuninnApp {
             chats: self.chats.clone(),
             active: self.active,
             theme: self.theme_mode,
+            personas: self.personas.clone(),
+            global_prompt: self.global_prompt.clone(),
         };
         if let Ok(bytes) = serde_json::to_vec(&workspace) {
             let _ = crate::secrets::save_blob("chats.bin", &bytes);
@@ -708,18 +864,18 @@ impl MuninnApp {
 
             ui.add_space(2.0);
 
-            let title_width = (ui.available_width() - 166.0).max(70.0);
+            let title_width = (ui.available_width() - 180.0).max(64.0);
             ui.allocate_ui_with_layout(
                 Vec2::new(title_width, 40.0),
                 Layout::top_down(Align::Min),
                 |ui| {
                     ui.add(
                         egui::Label::new(
-                            RichText::new(truncate(&self.title, 24)).size(16.0).strong(),
+                            RichText::new(truncate(&self.title, 22)).size(16.0).strong(),
                         )
                         .truncate(),
                     );
-                    let subtitle = if self.chat_tokens == 0 && self.chat_cost == 0.0 {
+                    let stats = if self.chat_tokens == 0 && self.chat_cost == 0.0 {
                         "начни разговор".to_owned()
                     } else {
                         format!(
@@ -728,23 +884,31 @@ impl MuninnApp {
                             format_tokens(self.chat_tokens)
                         )
                     };
-                    ui.label(
-                        RichText::new(subtitle)
-                            .size(10.5)
-                            .color(theme::c().text_secondary),
+                    let subtitle = format!("{} · {}", truncate(&self.persona_name(), 13), stats);
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(subtitle)
+                                .size(10.0)
+                                .color(theme::c().text_secondary),
+                        )
+                        .truncate(),
                     );
                 },
             );
 
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if model_chip(ui, &self.model_display_name(), 150.0).clicked() {
+                if model_chip(ui, &self.model_display_name(), 128.0).clicked() {
                     self.open_sheet(&ctx, Sheet::Models);
+                }
+                if more_button(ui).clicked() {
+                    self.open_sheet(&ctx, Sheet::ChatInfo);
                 }
             });
         });
     }
 
-    fn bubble(&self, ui: &mut Ui, msg: &Message) {
+    fn bubble(&self, ui: &mut Ui, msg: &Message, last: bool) -> bool {
+        let mut retry = false;
         let is_user = msg.role == Role::User;
         let viewport = ui.clip_rect().width();
         let max_w = (viewport * if is_user { 0.84 } else { 0.94 }).max(160.0);
@@ -769,7 +933,7 @@ impl MuninnApp {
                     });
             });
             ui.add_space(14.0);
-            return;
+            return false;
         }
 
         ui.with_layout(Layout::top_down(Align::Min), |ui| {
@@ -832,6 +996,12 @@ impl MuninnApp {
                             )
                             .wrap(),
                         );
+                        if last {
+                            ui.add_space(8.0);
+                            if pill_button(ui, "Повторить").clicked() {
+                                retry = true;
+                            }
+                        }
                     });
             } else if !msg.text.is_empty() {
                 crate::markdown::render(ui, &msg.text, text_w, msg.streaming);
@@ -852,6 +1022,9 @@ impl MuninnApp {
                     if link_button(ui, "копировать").clicked() {
                         crate::platform::clipboard_set(&msg.text);
                     }
+                    if last && !msg.error && link_button(ui, "ещё раз").clicked() {
+                        retry = true;
+                    }
                     if let (Some(cost), Some(tokens)) = (msg.cost, msg.tokens) {
                         ui.label(
                             RichText::new(format!(
@@ -868,6 +1041,7 @@ impl MuninnApp {
         });
 
         ui.add_space(18.0);
+        retry
     }
 
     fn empty_state(&mut self, ui: &mut Ui) {
@@ -903,6 +1077,19 @@ impl MuninnApp {
                     .size(if compact { 11.5 } else { 13.0 })
                     .color(theme::c().text_secondary),
             );
+
+            if !compact {
+                ui.add_space(8.0);
+                if link_button(
+                    ui,
+                    &format!("Личность: {}", truncate(&self.persona_name(), 20)),
+                )
+                .clicked()
+                {
+                    let ctx = ui.ctx().clone();
+                    self.open_sheet(&ctx, Sheet::Personas);
+                }
+            }
         });
 
         if compact {
@@ -928,8 +1115,7 @@ impl MuninnApp {
                 for (title, subtitle) in row {
                     if suggestion_card(ui, title, subtitle, width).clicked() {
                         self.draft = format!("{title}: ");
-                        ui.ctx()
-                            .memory_mut(|m| m.request_focus(Id::unique("composer")));
+                        self.focus_composer = true;
                     }
                 }
             });
@@ -954,6 +1140,24 @@ impl MuninnApp {
                     crate::native_input::TARGET_CHAT_SEARCH => self.chat_query = text,
                     crate::native_input::TARGET_BASE_URL => self.base_url = text,
                     crate::native_input::TARGET_API_KEY => self.api_key = text,
+                    crate::native_input::TARGET_CHAT_TITLE => self.title = text,
+                    crate::native_input::TARGET_CHAT_PROMPT => self.chat_prompt = text,
+                    crate::native_input::TARGET_GLOBAL_PROMPT => self.global_prompt = text,
+                    crate::native_input::TARGET_PERSONA_NAME => {
+                        if let Some(draft) = self.persona_draft.as_mut() {
+                            draft.name = text;
+                        }
+                    }
+                    crate::native_input::TARGET_PERSONA_DESCRIPTION => {
+                        if let Some(draft) = self.persona_draft.as_mut() {
+                            draft.description = text;
+                        }
+                    }
+                    crate::native_input::TARGET_PERSONA_PROMPT => {
+                        if let Some(draft) = self.persona_draft.as_mut() {
+                            draft.prompt = text;
+                        }
+                    }
                     _ => {}
                 },
                 crate::native_input::Event::Focus {
@@ -1025,6 +1229,23 @@ impl MuninnApp {
                     });
                 });
             });
+
+        if std::mem::take(&mut self.focus_composer)
+            && self.active_input.is_none()
+            && self.active_rect != Rect::NOTHING
+            && crate::native_input::show(
+                crate::native_input::TARGET_COMPOSER,
+                self.active_rect,
+                &self.draft,
+                "Сообщение…",
+                true,
+                false,
+                ctx.pixels_per_point(),
+            )
+        {
+            self.active_input = Some(crate::native_input::TARGET_COMPOSER);
+            self.repaint_ticks = 30;
+        }
 
         if submit && !self.streaming {
             self.stop_native();
@@ -1270,10 +1491,14 @@ impl MuninnApp {
         let max_h = (bottom - screen.top() - 16.0).max(220.0);
         let wanted = match self.sheet {
             Sheet::Models => screen.height() * 0.72,
-            Sheet::Settings => 420.0,
+            Sheet::Settings => 430.0,
+            Sheet::Personas => screen.height() * 0.76,
+            Sheet::PersonaEditor => screen.height() * 0.9,
+            Sheet::Prompt => screen.height() * 0.88,
+            Sheet::ChatInfo => 480.0,
             Sheet::None => 0.0,
         };
-        let height = wanted.min(620.0).min(max_h);
+        let height = wanted.min(700.0).min(max_h);
         let rect = Rect::from_min_max(
             Pos2::new(screen.left(), bottom - height),
             Pos2::new(screen.right(), bottom),
@@ -1327,6 +1552,10 @@ impl MuninnApp {
                         match self.sheet {
                             Sheet::Models => self.models_sheet(ui, &mut close),
                             Sheet::Settings => self.settings_sheet(ui, &mut close),
+                            Sheet::Personas => self.personas_sheet(ui, &mut close),
+                            Sheet::PersonaEditor => self.persona_editor_sheet(ui, &mut close),
+                            Sheet::Prompt => self.prompt_sheet(ui, &mut close),
+                            Sheet::ChatInfo => self.chat_sheet(ui, &mut close),
                             Sheet::None => {}
                         }
                     });
@@ -1474,6 +1703,7 @@ impl MuninnApp {
         let mut chosen: Option<usize> = None;
         let mut do_new = false;
         let mut do_settings = false;
+        let mut do_personas = false;
         let mut do_key = false;
 
         egui::Area::new(Id::unique("drawer"))
@@ -1563,7 +1793,7 @@ impl MuninnApp {
                         );
                         ui.add_space(4.0);
 
-                        let footer_space = 112.0;
+                        let footer_space = 196.0;
                         let list_height = (ui.available_height() - footer_space).max(120.0);
                         let query = self.chat_query.trim().to_lowercase();
                         let indices: Vec<usize> = (0..self.chats.len())
@@ -1638,6 +1868,10 @@ impl MuninnApp {
                             {
                                 do_settings = true;
                             }
+                            if menu_row(ui, "Личности", "роли, характер, промпты").clicked()
+                            {
+                                do_personas = true;
+                            }
                         });
                     });
             });
@@ -1656,6 +1890,11 @@ impl MuninnApp {
             self.drawer_open = false;
             self.sheet = Sheet::Settings;
             hide_keyboard(ctx);
+            return;
+        }
+        if do_personas {
+            self.drawer_open = false;
+            self.open_sheet(ctx, Sheet::Personas);
             return;
         }
         if do_key {
@@ -1715,6 +1954,623 @@ impl MuninnApp {
         }
         ui.add_space(8.0);
     }
+
+    // ------------------------------------------------------------------
+    // Personas and prompts
+    // ------------------------------------------------------------------
+
+    fn active_persona(&self) -> Option<&Persona> {
+        self.personas
+            .iter()
+            .find(|persona| persona.id == self.persona_id)
+    }
+
+    fn persona_name(&self) -> String {
+        self.active_persona()
+            .map(|persona| persona.name.clone())
+            .unwrap_or_else(|| "Без личности".to_owned())
+    }
+
+    fn save_persona_draft(&mut self) -> bool {
+        let Some(draft) = self.persona_draft.take() else {
+            return false;
+        };
+
+        let name = draft.name.trim().to_owned();
+        if name.is_empty() {
+            self.persona_draft = Some(draft);
+            return false;
+        }
+
+        let id = draft
+            .id
+            .clone()
+            .unwrap_or_else(|| format!("user:{}", next_id()));
+        let persona = Persona {
+            id: id.clone(),
+            name,
+            description: draft.description.trim().to_owned(),
+            prompt: draft.prompt.trim().to_owned(),
+            builtin: false,
+        };
+
+        if let Some(existing) = self.personas.iter_mut().find(|p| p.id == id) {
+            let builtin = existing.builtin;
+            *existing = Persona { builtin, ..persona };
+        } else {
+            self.personas.insert(0, persona);
+        }
+
+        self.persona_id = id;
+        self.persona_scroll = true;
+        self.confirm_persona_delete = false;
+        self.save_current();
+        true
+    }
+
+    fn delete_persona(&mut self, id: &str) {
+        self.personas.retain(|persona| persona.id != id);
+        if self.persona_id == id {
+            self.persona_id = if self
+                .personas
+                .iter()
+                .any(|persona| persona.id == prompt::DEFAULT_PERSONA)
+            {
+                prompt::DEFAULT_PERSONA.to_owned()
+            } else {
+                String::new()
+            };
+            self.save_current();
+        }
+        self.persist();
+    }
+
+    fn insert_variable(&mut self, token: &str) {
+        let target = self.active_input;
+        let field = if target == Some(crate::native_input::TARGET_GLOBAL_PROMPT) {
+            &mut self.global_prompt
+        } else {
+            &mut self.chat_prompt
+        };
+
+        if !field.is_empty() && !field.ends_with(' ') && !field.ends_with('\n') {
+            field.push(' ');
+        }
+        field.push_str(token);
+
+        if target == Some(crate::native_input::TARGET_GLOBAL_PROMPT)
+            || target == Some(crate::native_input::TARGET_CHAT_PROMPT)
+        {
+            crate::native_input::set_text(field);
+        }
+    }
+
+    fn personas_sheet(&mut self, ui: &mut Ui, close: &mut bool) {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Личности").size(18.0).strong());
+            ui.label(
+                RichText::new(format!("{}", self.personas.len()))
+                    .size(10.0)
+                    .color(theme::c().text_secondary),
+            );
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if close_button(ui).clicked() {
+                    *close = true;
+                }
+            });
+        });
+
+        ui.add_space(2.0);
+        ui.label(
+            RichText::new("Роль и стиль ответов для этого чата.")
+                .size(10.5)
+                .color(theme::c().text_secondary),
+        );
+        ui.add_space(8.0);
+
+        let mut pick: Option<String> = None;
+        let mut edit: Option<PersonaDraft> = None;
+
+        let list_height = (ui.available_height() - 156.0).max(150.0);
+        ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .max_height(list_height)
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+
+                let row = persona_row(
+                    ui,
+                    0,
+                    "Без личности",
+                    "только системный промпт",
+                    self.persona_id.is_empty(),
+                    false,
+                );
+                if row.select.clicked() {
+                    pick = Some(String::new());
+                }
+
+                for (index, persona) in self.personas.iter().enumerate() {
+                    let selected = self.persona_id == persona.id;
+                    let row = persona_row(
+                        ui,
+                        index + 1,
+                        &persona.name,
+                        &persona.description,
+                        selected,
+                        true,
+                    );
+                    if selected && self.persona_scroll {
+                        ui.scroll_to_rect_animation(
+                            row.select.rect,
+                            Some(Align::Center),
+                            egui::style::ScrollAnimation::none(),
+                        );
+                    }
+                    if row.select.clicked() {
+                        pick = Some(persona.id.clone());
+                    }
+                    if row.edit.clicked() {
+                        edit = Some(PersonaDraft::from_persona(persona));
+                    }
+                }
+
+                ui.add_space(4.0);
+            });
+        self.persona_scroll = false;
+
+        ui.add_space(6.0);
+        if action_button(
+            ui,
+            "+  Новая личность",
+            theme::c().accent,
+            theme::c().on_accent,
+        )
+        .clicked()
+        {
+            edit = Some(PersonaDraft::new());
+        }
+
+        ui.add_space(2.0);
+        if link_button(ui, "Вернуть встроенные").clicked() {
+            prompt::restore(&mut self.personas);
+            self.persist();
+        }
+
+        if let Some(draft) = edit {
+            self.stop_native();
+            self.save_current();
+            self.persona_draft = Some(draft);
+            self.confirm_persona_delete = false;
+            self.sheet = Sheet::PersonaEditor;
+            return;
+        }
+
+        if let Some(id) = pick {
+            self.persona_id = id;
+            self.save_current();
+            *close = true;
+        }
+    }
+
+    fn persona_editor_sheet(&mut self, ui: &mut Ui, close: &mut bool) {
+        let ctx = ui.ctx().clone();
+        let is_new = self
+            .persona_draft
+            .as_ref()
+            .is_some_and(|draft| draft.id.is_none());
+        let title = if is_new {
+            "Новая личность".to_owned()
+        } else {
+            self.persona_draft
+                .as_ref()
+                .map(|draft| truncate(&draft.name, 24))
+                .unwrap_or_else(|| "Личность".to_owned())
+        };
+
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(title).size(18.0).strong());
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if close_button(ui).clicked() {
+                    *close = true;
+                }
+            });
+        });
+
+        ui.add_space(6.0);
+
+        let fields_height = (ui.available_height() - 118.0).max(150.0);
+        ScrollArea::vertical()
+            .auto_shrink([false, true])
+            .max_height(fields_height)
+            .show(ui, |ui| {
+                let Some(draft) = self.persona_draft.as_mut() else {
+                    return;
+                };
+
+                field_label(ui, "НАЗВАНИЕ");
+                native_field(
+                    ui,
+                    &ctx,
+                    crate::native_input::TARGET_PERSONA_NAME,
+                    &mut draft.name,
+                    "Например, Критик",
+                    false,
+                    false,
+                    44.0,
+                    true,
+                    &mut self.active_input,
+                    &mut self.active_rect,
+                    &mut self.repaint_ticks,
+                );
+
+                ui.add_space(10.0);
+                field_label(ui, "ОПИСАНИЕ");
+                native_field(
+                    ui,
+                    &ctx,
+                    crate::native_input::TARGET_PERSONA_DESCRIPTION,
+                    &mut draft.description,
+                    "Одна строка для списка",
+                    false,
+                    false,
+                    44.0,
+                    true,
+                    &mut self.active_input,
+                    &mut self.active_rect,
+                    &mut self.repaint_ticks,
+                );
+
+                ui.add_space(10.0);
+                field_label(ui, "СИСТЕМНЫЙ ПРОМПТ");
+                native_field(
+                    ui,
+                    &ctx,
+                    crate::native_input::TARGET_PERSONA_PROMPT,
+                    &mut draft.prompt,
+                    "Как отвечать: роль, тон, правила…",
+                    true,
+                    false,
+                    140.0,
+                    true,
+                    &mut self.active_input,
+                    &mut self.active_rect,
+                    &mut self.repaint_ticks,
+                );
+
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new("Переменные: {{date}}, {{time}}, {{model}}, {{chat}}.")
+                        .size(9.5)
+                        .color(theme::c().text_tertiary),
+                );
+            });
+
+        ui.add_space(6.0);
+
+        let can_save = self
+            .persona_draft
+            .as_ref()
+            .is_some_and(|draft| !draft.name.trim().is_empty());
+        if ui
+            .add_enabled(
+                can_save,
+                egui::Button::new(RichText::new("Сохранить").size(14.0).color(if can_save {
+                    theme::c().on_accent
+                } else {
+                    theme::c().text_tertiary
+                }))
+                .fill(if can_save {
+                    theme::c().accent
+                } else {
+                    theme::c().surface_raised
+                })
+                .corner_radius(14)
+                .min_size(Vec2::new(ui.available_width(), 46.0)),
+            )
+            .clicked()
+            && self.save_persona_draft()
+        {
+            self.stop_native();
+            self.sheet = Sheet::Personas;
+            return;
+        }
+
+        ui.add_space(2.0);
+        let mut cancel = false;
+        let mut delete = false;
+        ui.horizontal(|ui| {
+            if link_button(ui, "Отмена").clicked() {
+                cancel = true;
+            }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if !is_new {
+                    let label = if self.confirm_persona_delete {
+                        "точно удалить?"
+                    } else {
+                        "удалить личность"
+                    };
+                    if link_button_colored(ui, label, theme::c().danger).clicked() {
+                        delete = true;
+                    }
+                }
+            });
+        });
+
+        if cancel {
+            self.stop_native();
+            self.persona_draft = None;
+            self.confirm_persona_delete = false;
+            self.sheet = Sheet::Personas;
+            return;
+        }
+
+        if delete {
+            if self.confirm_persona_delete {
+                if let Some(id) = self
+                    .persona_draft
+                    .as_ref()
+                    .and_then(|draft| draft.id.clone())
+                {
+                    self.stop_native();
+                    self.delete_persona(&id);
+                }
+                self.persona_draft = None;
+                self.confirm_persona_delete = false;
+                self.sheet = Sheet::Personas;
+            } else {
+                self.confirm_persona_delete = true;
+            }
+        }
+    }
+
+    fn prompt_sheet(&mut self, ui: &mut Ui, close: &mut bool) {
+        let ctx = ui.ctx().clone();
+
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Системный промпт").size(18.0).strong());
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if close_button(ui).clicked() {
+                    *close = true;
+                }
+            });
+        });
+        ui.add_space(2.0);
+        ui.label(
+            RichText::new("Три слоя: общий, личность, этот чат.")
+                .size(10.5)
+                .color(theme::c().text_secondary),
+        );
+        ui.add_space(6.0);
+
+        let mut open_personas = false;
+        if menu_row(
+            ui,
+            "Личность",
+            &format!("{} · изменить", self.persona_name()),
+        )
+        .clicked()
+        {
+            open_personas = true;
+        }
+
+        ui.add_space(6.0);
+
+        let fields_height = (ui.available_height() - 142.0).max(140.0);
+        ScrollArea::vertical()
+            .auto_shrink([false, true])
+            .max_height(fields_height)
+            .show(ui, |ui| {
+                field_label(ui, "ОБЩИЙ ПРОМПТ · ВСЕ ЧАТЫ");
+                native_field(
+                    ui,
+                    &ctx,
+                    crate::native_input::TARGET_GLOBAL_PROMPT,
+                    &mut self.global_prompt,
+                    "Например: отвечай кратко и по-русски…",
+                    true,
+                    false,
+                    92.0,
+                    true,
+                    &mut self.active_input,
+                    &mut self.active_rect,
+                    &mut self.repaint_ticks,
+                );
+
+                ui.add_space(10.0);
+                field_label(ui, "ПРОМПТ ЭТОГО ЧАТА");
+                native_field(
+                    ui,
+                    &ctx,
+                    crate::native_input::TARGET_CHAT_PROMPT,
+                    &mut self.chat_prompt,
+                    "Контекст, правила, формат ответа…",
+                    true,
+                    false,
+                    118.0,
+                    true,
+                    &mut self.active_input,
+                    &mut self.active_rect,
+                    &mut self.repaint_ticks,
+                );
+            });
+
+        ui.add_space(6.0);
+        ui.horizontal_wrapped(|ui| {
+            for (label, token) in [
+                ("дата", "{{date}}"),
+                ("время", "{{time}}"),
+                ("модель", "{{model}}"),
+                ("чат", "{{chat}}"),
+            ] {
+                if filter_chip(ui, label, false).clicked() {
+                    self.insert_variable(token);
+                }
+            }
+        });
+
+        ui.add_space(6.0);
+        if action_button(ui, "Готово", theme::c().accent, theme::c().on_accent).clicked() {
+            *close = true;
+        }
+
+        if open_personas {
+            self.stop_native();
+            self.flush_sheet_edits();
+            self.persona_draft = None;
+            self.sheet = Sheet::Personas;
+        }
+    }
+
+    fn chat_sheet(&mut self, ui: &mut Ui, close: &mut bool) {
+        let ctx = ui.ctx().clone();
+        let mut open_personas = false;
+        let mut open_prompt = false;
+        let mut copy = false;
+        let mut delete = false;
+
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Чат").size(18.0).strong());
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if close_button(ui).clicked() {
+                    *close = true;
+                }
+            });
+        });
+
+        ui.add_space(6.0);
+
+        let prompt_state =
+            if self.chat_prompt.trim().is_empty() && self.global_prompt.trim().is_empty() {
+                "не задан · добавить"
+            } else {
+                "задан · изменить"
+            };
+
+        let list_height = (ui.available_height() - 132.0).max(160.0);
+        ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .max_height(list_height)
+            .show(ui, |ui| {
+                field_label(ui, "НАЗВАНИЕ");
+                native_field(
+                    ui,
+                    &ctx,
+                    crate::native_input::TARGET_CHAT_TITLE,
+                    &mut self.title,
+                    "Название чата",
+                    false,
+                    false,
+                    44.0,
+                    true,
+                    &mut self.active_input,
+                    &mut self.active_rect,
+                    &mut self.repaint_ticks,
+                );
+
+                ui.add_space(8.0);
+                if menu_row(
+                    ui,
+                    "Личность",
+                    &format!("{} · изменить", self.persona_name()),
+                )
+                .clicked()
+                {
+                    open_personas = true;
+                }
+                if menu_row(ui, "Системный промпт", prompt_state).clicked() {
+                    open_prompt = true;
+                }
+
+                ui.add_space(10.0);
+                info_line(ui, "Сообщений", &self.messages.len().to_string());
+                ui.add_space(4.0);
+                if link_button(ui, "Копировать переписку").clicked() {
+                    copy = true;
+                }
+            });
+
+        ui.add_space(4.0);
+        if action_button(ui, "Готово", theme::c().accent, theme::c().on_accent).clicked() {
+            *close = true;
+        }
+
+        ui.add_space(2.0);
+        let danger_fill = theme::c().danger.gamma_multiply(0.14);
+        let label = if self.confirm_chat_delete {
+            "Точно удалить чат?"
+        } else {
+            "Удалить чат"
+        };
+        if action_button(ui, label, danger_fill, theme::c().danger).clicked() {
+            delete = true;
+        }
+
+        if copy {
+            crate::platform::clipboard_set(&self.transcript());
+        }
+
+        if delete {
+            if self.confirm_chat_delete {
+                self.delete_chat(&ctx);
+            } else {
+                self.confirm_chat_delete = true;
+            }
+        }
+
+        if open_personas {
+            self.stop_native();
+            self.flush_sheet_edits();
+            self.persona_draft = None;
+            self.persona_scroll = true;
+            self.sheet = Sheet::Personas;
+        } else if open_prompt {
+            self.stop_native();
+            self.flush_sheet_edits();
+            self.sheet = Sheet::Prompt;
+        }
+    }
+
+    fn transcript(&self) -> String {
+        let mut out = String::new();
+        for message in &self.messages {
+            if message.text.is_empty() {
+                continue;
+            }
+            let who = match message.role {
+                Role::User => "Ты",
+                Role::Assistant => "Muninn",
+                _ => "Система",
+            };
+            out.push_str(who);
+            out.push_str(":\n");
+            out.push_str(&message.text);
+            out.push_str("\n\n");
+        }
+        out.trim_end().to_owned()
+    }
+
+    fn delete_chat(&mut self, ctx: &egui::Context) {
+        self.stop_native();
+        self.stop();
+
+        if self.chats.len() <= 1 {
+            self.chats = vec![self.empty_snapshot()];
+            self.active = 0;
+        } else {
+            self.chats.remove(self.active);
+            if self.active >= self.chats.len() {
+                self.active = self.chats.len() - 1;
+            }
+        }
+
+        self.draft.clear();
+        self.load_active();
+        self.sheet = Sheet::None;
+        self.confirm_chat_delete = false;
+        hide_keyboard(ctx);
+        self.persist();
+    }
 }
 
 impl eframe::App for MuninnApp {
@@ -1722,7 +2578,7 @@ impl eframe::App for MuninnApp {
         self.drain_events(ui.ctx());
         self.drain_native();
 
-        if self.active_input.is_some() {
+        if self.active_input.is_some() && self.sheet == Sheet::None && !self.drawer_open {
             let clicked_outside = ui.ctx().input(|i| {
                 i.pointer.any_click()
                     && i.pointer
@@ -1751,6 +2607,13 @@ impl eframe::App for MuninnApp {
         let screen = ui.max_rect();
         let insets = crate::platform::system_insets(ui);
 
+        // The IME can be dismissed with the system back gesture without the
+        // activity seeing a back press: the inset collapse is the signal.
+        if self.active_input.is_some() && self.last_inset_bottom > 80.0 && insets.bottom < 60.0 {
+            self.stop_native();
+        }
+        self.last_inset_bottom = insets.bottom;
+
         if insets.top > 0.5 {
             egui::Panel::top("muninn_safe_top")
                 .exact_size(insets.top)
@@ -1769,6 +2632,7 @@ impl eframe::App for MuninnApp {
 
         let side = (12.0 + insets.left.max(insets.right)).round() as i8;
         let ctx = ui.ctx().clone();
+        let mut regenerate = false;
 
         match self.screen {
             Screen::Connect => {
@@ -1806,7 +2670,7 @@ impl eframe::App for MuninnApp {
                             .inner_margin(Margin::symmetric(side, 0)),
                     )
                     .show(ui, |ui| {
-                        ScrollArea::vertical()
+                        let scroll_out = ScrollArea::vertical()
                             .auto_shrink([false, false])
                             .stick_to_bottom(!self.messages.is_empty())
                             .show(ui, |ui| {
@@ -1816,18 +2680,40 @@ impl eframe::App for MuninnApp {
                                     self.empty_state(ui);
                                 }
 
-                                for msg in &self.messages {
-                                    self.bubble(ui, msg);
+                                let last = self.messages.len().saturating_sub(1);
+                                for (index, msg) in self.messages.iter().enumerate() {
+                                    if self.bubble(ui, msg, index == last) {
+                                        regenerate = true;
+                                    }
                                 }
 
                                 ui.add_space(4.0);
+
+                                if self.scroll_to_bottom {
+                                    ui.scroll_to_cursor(Some(Align::BOTTOM));
+                                }
                             });
+
+                        if self.scroll_to_bottom
+                            && scroll_out.state.clamped_offset().y + scroll_out.inner_rect.height()
+                                >= scroll_out.content_size.y - 1.0
+                        {
+                            self.scroll_to_bottom = false;
+                        }
                     });
             }
         }
 
+        if regenerate {
+            self.regenerate(&ctx);
+        }
+
         self.drawer(&ctx, screen, insets);
         self.sheets(&ctx, screen, insets);
+
+        if self.focus_composer {
+            ui.ctx().request_repaint();
+        }
 
         if self.active_input.is_some() {
             ui.ctx().request_repaint_after(Duration::from_millis(50));
@@ -1902,6 +2788,50 @@ fn menu_button(ui: &mut Ui) -> egui::Response {
             Stroke::new(1.6, color),
         );
     }
+    resp
+}
+
+fn more_button(ui: &mut Ui) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(36.0, 40.0), Sense::click());
+    if resp.hovered() {
+        ui.painter()
+            .rect_filled(rect, 10, theme::c().surface_overlay);
+    }
+    let color = if resp.hovered() {
+        theme::c().text
+    } else {
+        theme::c().text_secondary
+    };
+    let c = rect.center();
+    for dx in [-6.0, 0.0, 6.0] {
+        ui.painter()
+            .circle_filled(Pos2::new(c.x + dx, c.y), 1.8, color);
+    }
+    resp
+}
+
+fn pill_button(ui: &mut Ui, label: &str) -> egui::Response {
+    let galley = ui.painter().layout_no_wrap(
+        label.to_owned(),
+        FontId::proportional(12.0),
+        theme::c().on_accent,
+    );
+    let (rect, resp) =
+        ui.allocate_exact_size(Vec2::new(galley.size().x + 28.0, 34.0), Sense::click());
+    let fill = if resp.hovered() {
+        theme::c().accent_hover
+    } else {
+        theme::c().accent
+    };
+    ui.painter().rect_filled(rect, 17, fill);
+    ui.painter().galley(
+        Pos2::new(
+            rect.center().x - galley.size().x * 0.5,
+            rect.center().y - galley.size().y * 0.5,
+        ),
+        galley,
+        theme::c().on_accent,
+    );
     resp
 }
 
@@ -2093,7 +3023,7 @@ fn model_chip(ui: &mut Ui, label: &str, width: f32) -> egui::Response {
     p.text(
         Pos2::new(rect.left() + 12.0, rect.center().y),
         Align2::LEFT_CENTER,
-        truncate(label, 19),
+        truncate(label, 15),
         FontId::proportional(12.5),
         theme::c().text,
     );
@@ -2309,14 +3239,150 @@ fn menu_row(ui: &mut Ui, title: &str, subtitle: &str) -> egui::Response {
     resp
 }
 
+struct PersonaRow {
+    select: egui::Response,
+    edit: egui::Response,
+}
+
+fn persona_row(
+    ui: &mut Ui,
+    salt: usize,
+    name: &str,
+    description: &str,
+    selected: bool,
+    editable: bool,
+) -> PersonaRow {
+    let width = ui.available_width();
+    let (rect, select) = ui.allocate_exact_size(Vec2::new(width, 62.0), Sense::click());
+
+    let fill = if selected {
+        theme::c().accent_soft
+    } else if select.hovered() {
+        theme::c().surface_overlay
+    } else {
+        Color32::TRANSPARENT
+    };
+    if fill != Color32::TRANSPARENT {
+        ui.painter().rect_filled(rect.shrink(2.0), 12, fill);
+    }
+
+    let avatar_center = Pos2::new(rect.left() + 26.0, rect.center().y);
+    ui.painter().circle_filled(
+        avatar_center,
+        15.0,
+        if selected {
+            theme::c().accent
+        } else {
+            theme::c().surface_raised
+        },
+    );
+    let initial = name
+        .chars()
+        .next()
+        .map(|c| c.to_uppercase().to_string())
+        .unwrap_or_else(|| "M".to_owned());
+    ui.painter().text(
+        avatar_center,
+        Align2::CENTER_CENTER,
+        initial,
+        FontId::proportional(14.0),
+        if selected {
+            theme::c().on_accent
+        } else {
+            theme::c().accent
+        },
+    );
+
+    let p = ui.painter().with_clip_rect(rect);
+    p.text(
+        Pos2::new(rect.left() + 50.0, rect.top() + 12.0),
+        Align2::LEFT_TOP,
+        truncate(name, 22),
+        FontId::proportional(13.5),
+        if selected {
+            theme::c().accent
+        } else {
+            theme::c().text
+        },
+    );
+    p.text(
+        Pos2::new(rect.left() + 50.0, rect.top() + 33.0),
+        Align2::LEFT_TOP,
+        truncate(description, 30),
+        FontId::proportional(10.0),
+        theme::c().text_secondary,
+    );
+
+    let edit_rect = Rect::from_min_size(
+        Pos2::new(rect.right() - 44.0, rect.top() + 9.0),
+        Vec2::splat(44.0),
+    );
+    let edit = if editable {
+        for dx in [-6.0, 0.0, 6.0] {
+            p.circle_filled(
+                Pos2::new(edit_rect.center().x + dx, edit_rect.center().y),
+                1.7,
+                theme::c().text_secondary,
+            );
+        }
+        ui.interact(
+            edit_rect,
+            ui.scope_id().with(("persona_edit", salt)),
+            Sense::click(),
+        )
+    } else {
+        ui.allocate_exact_size(Vec2::ZERO, Sense::hover()).1
+    };
+
+    PersonaRow { select, edit }
+}
+
+fn info_line(ui: &mut Ui, label: &str, value: &str) {
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new(label)
+                .size(11.0)
+                .color(theme::c().text_secondary),
+        );
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.label(RichText::new(truncate(value, 30)).size(11.0));
+        });
+    });
+    ui.add_space(2.0);
+}
+
+fn action_button(ui: &mut Ui, label: &str, fill: Color32, text: Color32) -> egui::Response {
+    let width = ui.available_width();
+    ui.add(
+        egui::Button::new(RichText::new(label).size(14.0).color(text))
+            .fill(fill)
+            .corner_radius(14)
+            .min_size(Vec2::new(width, 46.0)),
+    )
+}
+
+fn link_button_colored(ui: &mut Ui, label: &str, color: Color32) -> egui::Response {
+    let galley = ui
+        .painter()
+        .layout_no_wrap(label.to_owned(), FontId::proportional(9.5), color);
+    let (rect, resp) =
+        ui.allocate_exact_size(Vec2::new(galley.size().x + 4.0, 18.0), Sense::click());
+    ui.painter().galley(
+        Pos2::new(rect.left() + 2.0, rect.center().y - galley.size().y * 0.5),
+        galley,
+        color,
+    );
+    resp
+}
+
 fn link_button(ui: &mut Ui, label: &str) -> egui::Response {
     let galley = ui.painter().layout_no_wrap(
         label.to_owned(),
-        FontId::proportional(9.5),
+        FontId::proportional(10.0),
         theme::c().text_secondary,
     );
     let (rect, resp) =
-        ui.allocate_exact_size(Vec2::new(galley.size().x + 4.0, 18.0), Sense::click());
+        ui.allocate_exact_size(Vec2::new(galley.size().x + 12.0, 32.0), Sense::click());
     ui.painter().galley(
         Pos2::new(rect.left() + 2.0, rect.center().y - galley.size().y * 0.5),
         galley,
@@ -2328,6 +3394,18 @@ fn link_button(ui: &mut Ui, label: &str) -> egui::Response {
 // ----------------------------------------------------------------------
 // Helpers
 // ----------------------------------------------------------------------
+
+fn placeholder() -> Message {
+    Message {
+        role: Role::Assistant,
+        text: String::new(),
+        reasoning: None,
+        cost: None,
+        tokens: None,
+        streaming: true,
+        error: false,
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::ptr_arg)]

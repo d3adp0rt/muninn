@@ -5,8 +5,9 @@
 - [x] Repository + licence + CI skeleton
 - [x] Toolchain: SDK 36, NDK 27.2, cargo-ndk, arm64 target
 - [x] egui + eframe + GameActivity renders on device
-- [x] IME bridge (GameTextInput → egui), insets, hardware keys
-- [ ] IME: emoji picker, selection handles, mid-string cursor polish
+- [x] Native `EditText` overlay for all text input: caret, selection,
+      long-press delete, emoji, clipboard, autocorrect
+- [x] Insets, keyboard-aware layout, hardware back
 - [ ] 10k-message list at 60 fps with fling
 - [x] SSE streaming, reasoning, usage/cost, Stop
 - [x] Markdown renderer (paragraphs, headings, lists, quotes, code, tables)
@@ -22,6 +23,11 @@ Onboarding (key, base URL, balance, free-model default), chats/tree, streaming,
 markdown/code/math, reasoning-on-tap, edit/branch/regenerate, per-chat cost,
 personas + prompt layers, model picker with categories, provider preferences,
 themes, RU/EN, SQLCipher, app-lock, trash/undo, export.
+
+Done: onboarding, streaming + markdown + code copy, reasoning-on-tap,
+per-chat cost, per-chat model, personas with three prompt layers, chat
+rename/delete/regenerate/retry, themes, model picker. Remaining: branching,
+edits as tree children, SQLCipher, app-lock, export, RU/EN toggle.
 
 ## M2 — multimodal + search
 
