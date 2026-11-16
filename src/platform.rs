@@ -132,25 +132,27 @@ mod android {
         app.set_ime_editor_info(input_type, TextInputAction::None, options);
     }
 
-    /// Current text state as seen by the Android IME.
-    pub fn ime_text() -> Option<String> {
-        crate::ANDROID_APP
-            .get()
-            .map(|app| app.text_input_state().text)
+    /// Current text and selection (byte offsets) as seen by the Android IME.
+    pub fn ime_state() -> Option<(String, (usize, usize))> {
+        let app = crate::ANDROID_APP.get()?;
+        let state = app.text_input_state();
+        let len = state.text.len();
+        Some((
+            state.text,
+            (state.selection.start.min(len), state.selection.end.min(len)),
+        ))
     }
 
-    /// Push text/selection from the Rust UI into the IME.
-    pub fn set_ime_text(text: &str, cursor_bytes: usize) {
+    /// Push text and selection (byte offsets) from the Rust UI into the IME.
+    pub fn set_ime_text(text: &str, start: usize, end: usize) {
         let Some(app) = crate::ANDROID_APP.get() else {
             return;
         };
-        let cursor = cursor_bytes.min(text.len());
+        let start = start.min(text.len());
+        let end = end.min(text.len());
         let state = TextInputState {
             text: text.to_owned(),
-            selection: TextSpan {
-                start: cursor,
-                end: cursor,
-            },
+            selection: TextSpan { start, end },
             ..Default::default()
         };
         app.set_text_input_state(state);
@@ -159,11 +161,11 @@ mod android {
 
 #[cfg(target_os = "android")]
 pub use android::{
-    configure_ime, ime_text, init_activity, set_back_handled, set_ime_text, take_back_requested,
+    configure_ime, ime_state, init_activity, set_back_handled, set_ime_text, take_back_requested,
 };
 
 #[cfg(not(target_os = "android"))]
-pub fn ime_text() -> Option<String> {
+pub fn ime_state() -> Option<(String, (usize, usize))> {
     None
 }
 
@@ -179,7 +181,7 @@ pub fn take_back_requested() -> bool {
 pub fn set_back_handled(_value: bool) {}
 
 #[cfg(not(target_os = "android"))]
-pub fn set_ime_text(_text: &str, _cursor_bytes: usize) {}
+pub fn set_ime_text(_text: &str, _start: usize, _end: usize) {}
 
 #[cfg(target_os = "android")]
 pub fn clipboard_get() -> Option<String> {

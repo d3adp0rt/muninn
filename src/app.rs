@@ -34,6 +34,10 @@ pub struct MuninnApp {
     key_ime: String,
     search_ime: String,
     composer_ime: String,
+    base_sel: (usize, usize),
+    key_sel: (usize, usize),
+    search_sel: (usize, usize),
+    composer_sel: (usize, usize),
     connecting: bool,
     error: Option<String>,
 
@@ -151,6 +155,10 @@ impl MuninnApp {
             key_ime: String::new(),
             search_ime: String::new(),
             composer_ime: String::new(),
+            base_sel: (0, 0),
+            key_sel: (0, 0),
+            search_sel: (0, 0),
+            composer_sel: (0, 0),
             connecting: false,
             error: None,
             models: Vec::new(),
@@ -364,7 +372,7 @@ impl MuninnApp {
 
         self.draft.clear();
         self.composer_ime.clear();
-        crate::platform::set_ime_text("", 0);
+        crate::platform::set_ime_text("", 0, 0);
         hide_keyboard(ctx);
         self.streaming = true;
 
@@ -585,8 +593,8 @@ impl MuninnApp {
     fn bubble(&self, ui: &mut Ui, msg: &Message) {
         let is_user = msg.role == Role::User;
         let viewport = ui.clip_rect().width();
-        let max_w = (viewport * if is_user { 0.84 } else { 0.92 }).max(140.0);
-        let text_w = (max_w - 24.0).max(100.0);
+        let max_w = (viewport * if is_user { 0.84 } else { 0.94 }).max(160.0);
+        let text_w = (max_w - if is_user { 24.0 } else { 34.0 }).max(120.0);
 
         if is_user {
             ui.with_layout(Layout::right_to_left(Align::TOP), |ui| {
@@ -599,87 +607,87 @@ impl MuninnApp {
                         ui.add(egui::Label::new(RichText::new(&msg.text).size(14.5)).wrap());
                     });
             });
-        } else {
-            ui.with_layout(Layout::top_down(Align::Min), |ui| {
-                egui::Frame::new()
-                    .fill(theme::CARD)
-                    .corner_radius(16)
-                    .stroke(if msg.error {
-                        Stroke::new(1.0, theme::DANGER)
-                    } else {
-                        Stroke::NONE
-                    })
-                    .inner_margin(Margin::symmetric(12, 9))
-                    .show(ui, |ui| {
-                        ui.set_max_width(text_w);
-
-                        if let Some(reasoning) = &msg.reasoning {
-                            let label = if msg.streaming && msg.text.is_empty() {
-                                "Размышления…".to_owned()
-                            } else {
-                                format!("Размышления · {} симв.", reasoning.chars().count())
-                            };
-
-                            egui::CollapsingHeader::new(
-                                RichText::new(label).size(10.5).color(theme::MUTED),
-                            )
-                            .default_open(false)
-                            .show(ui, |ui| {
-                                ui.add(
-                                    egui::Label::new(
-                                        RichText::new(reasoning)
-                                            .monospace()
-                                            .size(12.0)
-                                            .color(theme::MUTED),
-                                    )
-                                    .wrap(),
-                                );
-                            });
-                            ui.add_space(2.0);
-                        }
-
-                        if !msg.text.is_empty() {
-                            ui.add(
-                                egui::Label::new(RichText::new(&msg.text).size(14.5).color(
-                                    if msg.error {
-                                        theme::DANGER
-                                    } else {
-                                        theme::TEXT
-                                    },
-                                ))
-                                .wrap(),
-                            );
-                        } else if msg.streaming {
-                            ui.horizontal(|ui| {
-                                ui.spinner();
-                                ui.label(RichText::new("печатает…").size(11.0).color(theme::MUTED));
-                            });
-                        }
-                    });
-
-                if msg.cost.is_some() || msg.tokens.is_some() {
-                    ui.add_space(2.0);
-                    ui.horizontal(|ui| {
-                        if link_button(ui, "копировать").clicked() {
-                            crate::platform::clipboard_set(&msg.text);
-                        }
-                        if let (Some(cost), Some(tokens)) = (msg.cost, msg.tokens) {
-                            ui.label(
-                                RichText::new(format!(
-                                    "{} · {} tok",
-                                    format_cost(cost),
-                                    format_tokens(tokens)
-                                ))
-                                .size(9.5)
-                                .color(theme::MUTED),
-                            );
-                        }
-                    });
-                }
-            });
+            ui.add_space(14.0);
+            return;
         }
 
-        ui.add_space(10.0);
+        ui.with_layout(Layout::top_down(Align::Min), |ui| {
+            ui.set_max_width(text_w);
+            ui.horizontal(|ui| {
+                avatar(ui);
+                ui.add_space(6.0);
+                ui.label(RichText::new("Muninn").size(10.5).color(theme::MUTED));
+            });
+            ui.add_space(5.0);
+
+            if let Some(reasoning) = &msg.reasoning {
+                let label = if msg.streaming && msg.text.is_empty() {
+                    "Размышления…".to_owned()
+                } else {
+                    format!("Размышления · {} симв.", reasoning.chars().count())
+                };
+
+                egui::CollapsingHeader::new(RichText::new(label).size(10.5).color(theme::MUTED))
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(reasoning)
+                                    .monospace()
+                                    .size(12.0)
+                                    .color(theme::MUTED),
+                            )
+                            .wrap(),
+                        );
+                    });
+                ui.add_space(3.0);
+            }
+
+            if msg.error {
+                egui::Frame::new()
+                    .fill(theme::SURFACE)
+                    .corner_radius(12)
+                    .stroke(Stroke::new(1.0, theme::DANGER))
+                    .inner_margin(Margin::symmetric(12, 9))
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(&msg.text).size(13.5).color(theme::DANGER),
+                            )
+                            .wrap(),
+                        );
+                    });
+            } else if !msg.text.is_empty() {
+                crate::markdown::render(ui, &msg.text, text_w, msg.streaming);
+            } else if msg.streaming {
+                ui.horizontal(|ui| {
+                    typing_dot(ui);
+                    ui.label(RichText::new("печатает…").size(11.0).color(theme::MUTED));
+                });
+            }
+
+            if !msg.streaming && !msg.text.is_empty() {
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    if link_button(ui, "копировать").clicked() {
+                        crate::platform::clipboard_set(&msg.text);
+                    }
+                    if let (Some(cost), Some(tokens)) = (msg.cost, msg.tokens) {
+                        ui.label(
+                            RichText::new(format!(
+                                "{} · {} tok",
+                                format_cost(cost),
+                                format_tokens(tokens)
+                            ))
+                            .size(9.5)
+                            .color(theme::MUTED),
+                        );
+                    }
+                });
+            }
+        });
+
+        ui.add_space(18.0);
     }
 
     fn empty_state(&mut self, ui: &mut Ui) {
@@ -732,6 +740,7 @@ impl MuninnApp {
                     &mut self.draft,
                     &mut self.ime_focused,
                     &mut self.composer_ime,
+                    &mut self.composer_sel,
                     true,
                     false,
                 );
@@ -816,6 +825,7 @@ impl MuninnApp {
                             &mut self.base_url,
                             &mut self.base_focus,
                             &mut self.base_ime,
+                            &mut self.base_sel,
                             false,
                             false,
                         );
@@ -835,6 +845,7 @@ impl MuninnApp {
                             &mut self.api_key,
                             &mut self.key_focus,
                             &mut self.key_ime,
+                            &mut self.key_sel,
                             false,
                             true,
                         );
@@ -855,6 +866,7 @@ impl MuninnApp {
                                     crate::platform::set_ime_text(
                                         &self.api_key,
                                         self.api_key.len(),
+                                        self.api_key.len(),
                                     );
                                 }
                             }
@@ -871,6 +883,7 @@ impl MuninnApp {
                                 if self.base_focus {
                                     crate::platform::set_ime_text(
                                         &self.base_url,
+                                        self.base_url.len(),
                                         self.base_url.len(),
                                     );
                                 }
@@ -1061,6 +1074,7 @@ impl MuninnApp {
             &mut self.model_query,
             &mut self.model_search_focus,
             &mut self.search_ime,
+            &mut self.search_sel,
             false,
             false,
         );
@@ -1268,6 +1282,27 @@ impl eframe::App for MuninnApp {
 // ----------------------------------------------------------------------
 // Widgets
 // ----------------------------------------------------------------------
+
+fn avatar(ui: &mut Ui) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::hover());
+    ui.painter()
+        .circle_filled(rect.center(), 9.0, theme::ACCENT_SOFT);
+    ui.painter().text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        "M",
+        FontId::proportional(10.0),
+        theme::ACCENT,
+    );
+}
+
+fn typing_dot(ui: &mut Ui) {
+    let time = ui.input(|i| i.time) as f32;
+    let phase = ((time * 2.4).sin() * 0.5 + 0.5) * 0.75 + 0.25;
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(8.0), Sense::hover());
+    ui.painter()
+        .circle_filled(rect.center(), 3.0, theme::ACCENT.gamma_multiply(phase));
+}
 
 fn menu_button(ui: &mut Ui) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(34.0), Sense::click());
@@ -1666,45 +1701,100 @@ fn field_label(ui: &mut Ui, text: &str) {
     ui.add_space(2.0);
 }
 
-/// Mirror the Android IME text state into a field.
+/// Mirror the Android IME text and selection into an egui text field.
 ///
-/// `last_ime` is what the IME reported last. A difference means the IME edited
-/// the text; if only `text` changed, egui (hardware keyboard) edited it and we
-/// push it back so the next soft-key event has the same buffer.
+/// The IME is the source of truth for soft-keyboard edits; egui is the source
+/// for taps, arrows and hardware keys. Each side wins only when it actually
+/// changed since the last frame, so neither can revert the other.
+#[allow(clippy::too_many_arguments)]
 fn ime_sync(
     ui: &Ui,
     resp: &egui::Response,
     text: &mut String,
     focused: &mut bool,
     last_ime: &mut String,
+    last_sel: &mut (usize, usize),
     multiline: bool,
     password: bool,
 ) {
-    if resp.has_focus() {
-        ui.ctx().request_repaint_after(Duration::from_millis(50));
-
-        if !*focused {
-            crate::platform::configure_ime(multiline, password);
-            crate::platform::set_ime_text(text, text.len());
-            *last_ime = text.clone();
-            *focused = true;
-            return;
-        }
-
-        if let Some(ime) = crate::platform::ime_text() {
-            if ime != *last_ime {
-                *last_ime = ime.clone();
-                if ime != *text {
-                    *text = ime;
-                }
-            } else if *text != *last_ime {
-                crate::platform::set_ime_text(text, text.len());
-                *last_ime = text.clone();
-            }
-        }
-    } else if *focused {
+    if !resp.has_focus() {
         *focused = false;
+        return;
     }
+
+    ui.ctx().request_repaint_after(Duration::from_millis(50));
+
+    if !*focused {
+        crate::platform::configure_ime(multiline, password);
+        let end = text.len();
+        crate::platform::set_ime_text(text, end, end);
+        *last_ime = text.clone();
+        *last_sel = (end, end);
+        *focused = true;
+        return;
+    }
+
+    let egui_sel = egui_selection(ui.ctx(), resp.id, text);
+    let Some((ime_text, ime_sel)) = crate::platform::ime_state() else {
+        return;
+    };
+
+    if ime_text != *last_ime {
+        // Soft-keyboard edit or paste.
+        *last_ime = ime_text.clone();
+        if ime_text != *text {
+            *text = ime_text;
+        }
+        set_egui_selection(ui.ctx(), resp.id, text, ime_sel);
+        *last_sel = ime_sel;
+        ui.ctx().request_repaint();
+        return;
+    }
+
+    if let Some(sel) = egui_sel
+        && sel != *last_sel
+    {
+        // Tap, arrow key or hardware edit. Push both text and selection.
+        crate::platform::set_ime_text(text, sel.0, sel.1);
+        *last_ime = text.clone();
+        *last_sel = sel;
+    }
+}
+
+fn egui_selection(ctx: &egui::Context, id: Id, text: &str) -> Option<(usize, usize)> {
+    let state = egui::widgets::text_edit::TextEditState::load(ctx, id)?;
+    let range = state.cursor.char_range()?;
+    let a = char_to_byte(text, range.primary.index.0);
+    let b = char_to_byte(text, range.secondary.index.0);
+    Some((a.min(b), a.max(b)))
+}
+
+fn set_egui_selection(ctx: &egui::Context, id: Id, text: &str, selection: (usize, usize)) {
+    let start = byte_to_char(text, selection.0);
+    let end = byte_to_char(text, selection.1);
+    let mut state = egui::widgets::text_edit::TextEditState::load(ctx, id).unwrap_or_default();
+    state
+        .cursor
+        .set_char_range(Some(egui::text::CCursorRange::two(
+            egui::text::CCursor::new(start),
+            egui::text::CCursor::new(end),
+        )));
+    state.store(ctx, id);
+}
+
+fn char_to_byte(text: &str, char_index: usize) -> usize {
+    text.char_indices()
+        .nth(char_index)
+        .map(|(byte, _)| byte)
+        .unwrap_or(text.len())
+}
+
+fn byte_to_char(text: &str, mut byte: usize) -> usize {
+    byte = byte.min(text.len());
+    while byte > 0 && !text.is_char_boundary(byte) {
+        byte -= 1;
+    }
+    text[..byte].chars().count()
 }
 
 fn hide_keyboard(ctx: &egui::Context) {

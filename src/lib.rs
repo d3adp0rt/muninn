@@ -4,6 +4,7 @@
 //! for local development.
 
 mod app;
+mod markdown;
 mod platform;
 mod runtime;
 mod secrets;

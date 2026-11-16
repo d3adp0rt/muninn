@@ -9,7 +9,8 @@
 - [ ] IME: emoji picker, selection handles, mid-string cursor polish
 - [ ] 10k-message list at 60 fps with fling
 - [x] SSE streaming, reasoning, usage/cost, Stop
-- [ ] Incremental markdown rendering
+- [x] Markdown renderer (paragraphs, headings, lists, quotes, code, tables)
+- [ ] Math (LaTeX), syntax highlighting
 - [ ] SQLCipher + FTS5 open/query after biometric unlock
 - [ ] SAF picker, microphone → WAV, STT round-trip
 - [ ] CPython cross-compile spike (`libpyrunner.so` + stdlib zip + pip wheel)
