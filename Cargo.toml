@@ -1,0 +1,50 @@
+[package]
+name = "muninn"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "GPL-3.0-or-later"
+description = "Private, local-first OpenRouter client for Android"
+repository = "https://github.com/d3adp0rt/muninn"
+publish = false
+
+[lib]
+name = "muninn"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "muninn-desktop"
+path = "src/main.rs"
+required-features = ["desktop"]
+
+[features]
+default = []
+desktop = []
+
+[dependencies]
+log = "0.4"
+egui = "0.37"
+
+[target.'cfg(target_os = "android")'.dependencies]
+eframe = { version = "0.37", default-features = false, features = [
+    "default_fonts",
+    "wgpu",
+    "android-game-activity",
+] }
+winit = "0.30"
+android_logger = "0.15"
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+eframe = { version = "0.37", default-features = false, features = [
+    "default_fonts",
+    "wgpu",
+    "wayland",
+    "x11",
+] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+opt-level = "s"
+panic = "abort"

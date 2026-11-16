@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="ActivityTheme" parent="Theme.AppCompat.DayNight.NoActionBar">
+        <item name="android:windowBackground">@color/muninn_bg</item>
+        <item name="android:colorBackground">@color/muninn_bg</item>
+        <item name="android:navigationBarColor">@color/muninn_bg</item>
+        <item name="android:statusBarColor">@color/muninn_surface</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowActionModeOverlay">true</item>
+    </style>
+</resources>

@@ -1,0 +1,30 @@
+/target
+**/*.rs.bk
+
+# Android / Gradle
+/android/.gradle
+/android/build
+/android/app/build
+/android/local.properties
+/android/.idea
+/android/*.iml
+/android/captures
+/android/.cxx
+
+# Build outputs copied into the Android project
+/android/app/src/main/jniLibs
+
+# Signing (debug keystore is intentionally committed later)
+*.jks
+*.keystore
+!android/debug.keystore
+keystore.properties
+
+# Editor / OS
+.DS_Store
+*.swp
+.vscode
+.idea
+
+# Rust symbol/debug leftovers
+*.pdb
