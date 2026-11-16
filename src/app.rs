@@ -476,6 +476,8 @@ impl MuninnApp {
                     crate::secrets::clear();
                     self.screen = Screen::Connect;
                     self.api_key.clear();
+                    self.base_url = OPENROUTER_BASE.to_owned();
+                    self.connecting = false;
                     self.models.clear();
                     self.messages.clear();
                     self.title = "New chat".into();
