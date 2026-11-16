@@ -7,6 +7,6 @@ pub mod client;
 pub mod sse;
 pub mod types;
 
-pub use client::{ApiError, ChatStream, Client, ClientConfig};
+pub use client::{ApiError, ChatStream, Client, ClientConfig, StreamEvent};
 pub use sse::{SseEvent, SseParser};
 pub use types::*;

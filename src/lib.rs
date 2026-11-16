@@ -5,6 +5,8 @@
 
 mod app;
 mod platform;
+mod runtime;
+mod secrets;
 mod theme;
 
 pub mod api;
@@ -35,6 +37,7 @@ mod android_entry {
 
         // Keep a clone for insets; eframe consumes the original for winit.
         let _ = crate::ANDROID_APP.set(app.clone());
+        crate::platform::init_activity(&app);
 
         let options = eframe::NativeOptions {
             android_app: Some(app),
