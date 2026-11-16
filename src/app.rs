@@ -1,15 +1,24 @@
-//! Muninn UI shell.
+//! Muninn UI.
 //!
-//! M1 in progress: onboarding, model catalog, streaming chat.
+//! Design notes:
+//! - one screen at a time; secondary surfaces are bottom sheets, never floating
+//!   windows (they end up under the status bar on tall phones);
+//! - every text field goes through [`ime_sync`], because winit's Android backend
+//!   does not forward IME commits;
+//! - the composer owns the bottom safe area and grows above the keyboard.
 
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::Duration;
 
-use eframe::egui::{self, Align, CornerRadius, Layout, Margin, RichText, ScrollArea, Vec2};
+use eframe::egui::{
+    self, Align, Align2, Color32, CornerRadius, FontId, Id, Layout, Margin, Pos2, Rect, RichText,
+    ScrollArea, Sense, Stroke, Ui, Vec2,
+};
 
 use crate::api::{
     ChatRequest, Client, ClientConfig, ModelInfo, RequestMessage, Role, StreamEvent, Usage,
 };
+use crate::platform::Insets;
 use crate::theme;
 
 pub const OPENROUTER_BASE: &str = "https://openrouter.ai/api/v1";
@@ -21,13 +30,19 @@ pub struct MuninnApp {
     api_key: String,
     base_focus: bool,
     key_focus: bool,
+    base_ime: String,
+    key_ime: String,
+    search_ime: String,
+    composer_ime: String,
     connecting: bool,
     error: Option<String>,
 
     models: Vec<ModelEntry>,
     model: String,
-    model_menu: bool,
+    sheet: Sheet,
     model_query: String,
+    model_search_focus: bool,
+    model_filter: ModelFilter,
 
     title: String,
     messages: Vec<Message>,
@@ -50,14 +65,52 @@ enum Screen {
     Chat,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Sheet {
+    None,
+    Models,
+    Menu,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ModelFilter {
+    All,
+    Free,
+    Think,
+    Tools,
+    Vision,
+}
+
+impl ModelFilter {
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "Все",
+            Self::Free => "Free",
+            Self::Think => "Think",
+            Self::Tools => "Tools",
+            Self::Vision => "Vision",
+        }
+    }
+
+    fn accepts(self, model: &ModelEntry) -> bool {
+        match self {
+            Self::All => true,
+            Self::Free => model.free,
+            Self::Think => model.reasoning,
+            Self::Tools => model.tools,
+            Self::Vision => model.vision,
+        }
+    }
+}
+
 struct ModelEntry {
     id: String,
     name: String,
     context: u64,
     prompt_per_m: f64,
-    completion_per_m: f64,
     reasoning: bool,
     tools: bool,
+    vision: bool,
     free: bool,
 }
 
@@ -94,13 +147,19 @@ impl MuninnApp {
             api_key: String::new(),
             base_focus: false,
             key_focus: false,
+            base_ime: String::new(),
+            key_ime: String::new(),
+            search_ime: String::new(),
+            composer_ime: String::new(),
             connecting: false,
             error: None,
             models: Vec::new(),
             model: "openrouter/free".to_owned(),
-            model_menu: false,
+            sheet: Sheet::None,
             model_query: String::new(),
-            title: "New chat".to_owned(),
+            model_search_focus: false,
+            model_filter: ModelFilter::All,
+            title: "Новый чат".to_owned(),
             messages: Vec::new(),
             draft: String::new(),
             ime_focused: false,
@@ -124,7 +183,7 @@ impl MuninnApp {
     }
 
     // ------------------------------------------------------------------
-    // Connection
+    // Networking
     // ------------------------------------------------------------------
 
     fn connect(&mut self, ctx: &egui::Context) {
@@ -189,16 +248,12 @@ impl MuninnApp {
                 let free = (prompt == 0.0 && completion == 0.0) || m.id.ends_with(":free");
                 ModelEntry {
                     id: m.id,
-                    name: if m.name.is_empty() {
-                        String::new()
-                    } else {
-                        m.name
-                    },
+                    name: m.name,
                     context: m.context_length.unwrap_or(0),
                     prompt_per_m: prompt * 1_000_000.0,
-                    completion_per_m: completion * 1_000_000.0,
                     reasoning: m.supported_parameters.iter().any(|p| p == "reasoning"),
                     tools: m.supported_parameters.iter().any(|p| p == "tools"),
+                    vision: m.architecture.input_modalities.iter().any(|m| m == "image"),
                     free,
                 }
             })
@@ -226,13 +281,26 @@ impl MuninnApp {
         self.models.iter().find(|m| m.id == self.model)
     }
 
+    fn model_display_name(&self) -> String {
+        let raw = self
+            .model_entry()
+            .map(|m| {
+                if m.name.is_empty() {
+                    m.id.clone()
+                } else {
+                    m.name.clone()
+                }
+            })
+            .unwrap_or_else(|| self.model.clone());
+
+        raw.split_once(':')
+            .map(|(_, rest)| rest.trim().to_owned())
+            .unwrap_or(raw)
+    }
+
     fn is_openrouter(&self) -> bool {
         self.base_url.contains("openrouter.ai")
     }
-
-    // ------------------------------------------------------------------
-    // Streaming
-    // ------------------------------------------------------------------
 
     fn send(&mut self, ctx: &egui::Context) {
         if self.streaming {
@@ -244,14 +312,7 @@ impl MuninnApp {
             return;
         }
 
-        let mut history: Vec<RequestMessage> = self
-            .messages
-            .iter()
-            .filter(|m| !m.error && !m.text.is_empty())
-            .map(|m| RequestMessage::text(m.role, m.text.clone()))
-            .collect();
-
-        if self.title == "New chat" {
+        if self.title == "Новый чат" {
             self.title = text.chars().take(48).collect();
         }
 
@@ -265,7 +326,16 @@ impl MuninnApp {
             error: false,
         });
 
-        let mut request = ChatRequest::new(self.model.clone(), std::mem::take(&mut history));
+        // The user turn must be part of the request; build history after
+        // pushing it, and skip error bubbles.
+        let history: Vec<RequestMessage> = self
+            .messages
+            .iter()
+            .filter(|m| !m.error && !m.text.is_empty())
+            .map(|m| RequestMessage::text(m.role, m.text.clone()))
+            .collect();
+
+        let mut request = ChatRequest::new(self.model.clone(), history);
         request.stream = Some(true);
 
         if self.deep_think && self.model_entry().is_some_and(|m| m.reasoning) {
@@ -293,7 +363,9 @@ impl MuninnApp {
         });
 
         self.draft.clear();
+        self.composer_ime.clear();
         crate::platform::set_ime_text("", 0);
+        hide_keyboard(ctx);
         self.streaming = true;
 
         let client = match Client::new(ClientConfig {
@@ -360,9 +432,9 @@ impl MuninnApp {
             msg.streaming = false;
             msg.error = true;
             if msg.text.is_empty() {
-                msg.text = format!("⚠ {error}");
+                msg.text = error;
             } else {
-                msg.text.push_str(&format!("\n\n⚠ {error}"));
+                msg.text.push_str(&format!("\n\n{error}"));
             }
         }
     }
@@ -373,6 +445,7 @@ impl MuninnApp {
                 UiEvent::Models(models) => {
                     self.connecting = false;
                     self.apply_models(models);
+                    hide_keyboard(ctx);
                 }
                 UiEvent::ConnectError(error) => {
                     self.connecting = false;
@@ -421,112 +494,134 @@ impl MuninnApp {
     }
 
     // ------------------------------------------------------------------
-    // UI
+    // Actions
     // ------------------------------------------------------------------
 
-    fn header(&mut self, ui: &mut egui::Ui) {
+    fn open_sheet(&mut self, ctx: &egui::Context, sheet: Sheet) {
+        self.sheet = sheet;
+        self.model_search_focus = false;
+        hide_keyboard(ctx);
+    }
+
+    fn close_sheet(&mut self, ctx: &egui::Context) {
+        self.sheet = Sheet::None;
+        self.model_search_focus = false;
+        hide_keyboard(ctx);
+    }
+
+    fn new_chat(&mut self, ctx: &egui::Context) {
+        self.stop();
+        self.messages.clear();
+        self.title = "Новый чат".into();
+        self.chat_cost = 0.0;
+        self.chat_tokens = 0;
+        self.sheet = Sheet::None;
+        hide_keyboard(ctx);
+    }
+
+    fn change_key(&mut self, ctx: &egui::Context) {
+        self.stop();
+        crate::secrets::clear();
+        self.screen = Screen::Connect;
+        self.api_key.clear();
+        self.base_url = OPENROUTER_BASE.to_owned();
+        self.connecting = false;
+        self.models.clear();
+        self.messages.clear();
+        self.title = "Новый чат".into();
+        self.chat_cost = 0.0;
+        self.chat_tokens = 0;
+        self.sheet = Sheet::None;
+        self.error = None;
+        hide_keyboard(ctx);
+    }
+
+    // ------------------------------------------------------------------
+    // Chat UI
+    // ------------------------------------------------------------------
+
+    fn header(&mut self, ui: &mut Ui) {
+        let ctx = ui.ctx().clone();
+
         ui.horizontal(|ui| {
-            ui.add_space(4.0);
-            ui.vertical(|ui| {
-                ui.label(RichText::new("Muninn").size(19.0).strong());
-                ui.label(
-                    RichText::new(format!(
-                        "{} · {} · {} tok",
-                        truncate(&self.title, 28),
-                        format_cost(self.chat_cost),
-                        format_tokens(self.chat_tokens)
-                    ))
-                    .size(10.5)
-                    .color(theme::MUTED),
-                );
-            });
+            if menu_button(ui).clicked() {
+                self.open_sheet(&ctx, Sheet::Menu);
+            }
+
+            ui.add_space(2.0);
+
+            let title_width = (ui.available_width() - 166.0).max(70.0);
+            ui.allocate_ui_with_layout(
+                Vec2::new(title_width, 40.0),
+                Layout::top_down(Align::Min),
+                |ui| {
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(truncate(&self.title, 24)).size(16.0).strong(),
+                        )
+                        .truncate(),
+                    );
+                    let subtitle = if self.chat_tokens == 0 && self.chat_cost == 0.0 {
+                        "начни разговор".to_owned()
+                    } else {
+                        format!(
+                            "{} · {} tok",
+                            format_cost(self.chat_cost),
+                            format_tokens(self.chat_tokens)
+                        )
+                    };
+                    ui.label(RichText::new(subtitle).size(10.0).color(theme::MUTED));
+                },
+            );
 
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let short = self.model.rsplit('/').next().unwrap_or(&self.model);
-                let chip = egui::Button::new(
-                    RichText::new(format!("{short}  v"))
-                        .size(12.5)
-                        .color(theme::TEXT),
-                )
-                .fill(theme::CARD)
-                .corner_radius(16);
-
-                if ui.add(chip).on_hover_text(&self.model).clicked() {
-                    self.model_menu = true;
-                }
-
-                if ui
-                    .add(egui::Button::new(RichText::new("+").size(20.0)).frame(false))
-                    .on_hover_text("Новый чат")
-                    .clicked()
-                {
-                    self.stop();
-                    self.messages.clear();
-                    self.title = "New chat".into();
-                    self.chat_cost = 0.0;
-                    self.chat_tokens = 0;
-                }
-
-                if ui
-                    .add(egui::Button::new(RichText::new("key").size(11.0)).frame(false))
-                    .on_hover_text("Сменить ключ")
-                    .clicked()
-                {
-                    self.stop();
-                    crate::secrets::clear();
-                    self.screen = Screen::Connect;
-                    self.api_key.clear();
-                    self.base_url = OPENROUTER_BASE.to_owned();
-                    self.connecting = false;
-                    self.models.clear();
-                    self.messages.clear();
-                    self.title = "New chat".into();
-                    self.chat_cost = 0.0;
-                    self.chat_tokens = 0;
-                    self.error = None;
+                if model_chip(ui, &self.model_display_name(), 158.0).clicked() {
+                    self.open_sheet(&ctx, Sheet::Models);
                 }
             });
         });
     }
 
-    fn bubble(&self, ui: &mut egui::Ui, msg: &Message) {
+    fn bubble(&self, ui: &mut Ui, msg: &Message) {
         let is_user = msg.role == Role::User;
         let viewport = ui.clip_rect().width();
-        let max_w = (viewport * if is_user { 0.84 } else { 0.88 }).max(140.0);
-        let text_w = (max_w - 28.0).max(100.0);
+        let max_w = (viewport * if is_user { 0.84 } else { 0.92 }).max(140.0);
+        let text_w = (max_w - 24.0).max(100.0);
 
         if is_user {
             ui.with_layout(Layout::right_to_left(Align::TOP), |ui| {
                 egui::Frame::new()
-                    .fill(theme::ACCENT_SOFT)
+                    .fill(theme::USER_BUBBLE)
                     .corner_radius(18)
-                    .inner_margin(Margin::symmetric(14, 10))
+                    .inner_margin(Margin::symmetric(12, 9))
                     .show(ui, |ui| {
                         ui.set_max_width(text_w);
-                        ui.add(egui::Label::new(RichText::new(&msg.text).size(15.5)).wrap());
+                        ui.add(egui::Label::new(RichText::new(&msg.text).size(14.5)).wrap());
                     });
             });
         } else {
             ui.with_layout(Layout::top_down(Align::Min), |ui| {
                 egui::Frame::new()
-                    .fill(if msg.error {
-                        theme::SURFACE
+                    .fill(theme::CARD)
+                    .corner_radius(16)
+                    .stroke(if msg.error {
+                        Stroke::new(1.0, theme::DANGER)
                     } else {
-                        theme::CARD
+                        Stroke::NONE
                     })
-                    .corner_radius(18)
-                    .inner_margin(Margin::symmetric(14, 10))
+                    .inner_margin(Margin::symmetric(12, 9))
                     .show(ui, |ui| {
                         ui.set_max_width(text_w);
 
                         if let Some(reasoning) = &msg.reasoning {
                             let label = if msg.streaming && msg.text.is_empty() {
-                                "Thinking…".to_owned()
+                                "Размышления…".to_owned()
                             } else {
-                                format!("Thinking · {} chars", reasoning.chars().count())
+                                format!("Размышления · {} симв.", reasoning.chars().count())
                             };
+
                             egui::CollapsingHeader::new(
-                                RichText::new(label).size(12.0).color(theme::MUTED),
+                                RichText::new(label).size(10.5).color(theme::MUTED),
                             )
                             .default_open(false)
                             .show(ui, |ui| {
@@ -534,7 +629,7 @@ impl MuninnApp {
                                     egui::Label::new(
                                         RichText::new(reasoning)
                                             .monospace()
-                                            .size(12.5)
+                                            .size(12.0)
                                             .color(theme::MUTED),
                                     )
                                     .wrap(),
@@ -545,7 +640,7 @@ impl MuninnApp {
 
                         if !msg.text.is_empty() {
                             ui.add(
-                                egui::Label::new(RichText::new(&msg.text).size(15.5).color(
+                                egui::Label::new(RichText::new(&msg.text).size(14.5).color(
                                     if msg.error {
                                         theme::DANGER
                                     } else {
@@ -557,36 +652,28 @@ impl MuninnApp {
                         } else if msg.streaming {
                             ui.horizontal(|ui| {
                                 ui.spinner();
-                                ui.label(
-                                    RichText::new("ждём ответ…").size(12.0).color(theme::MUTED),
-                                );
+                                ui.label(RichText::new("печатает…").size(11.0).color(theme::MUTED));
                             });
                         }
                     });
 
-                if let (Some(cost), Some(tokens)) = (msg.cost, msg.tokens) {
+                if msg.cost.is_some() || msg.tokens.is_some() {
                     ui.add_space(2.0);
                     ui.horizontal(|ui| {
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    RichText::new("copy").size(10.5).color(theme::MUTED),
-                                )
-                                .frame(false),
-                            )
-                            .clicked()
-                        {
+                        if link_button(ui, "копировать").clicked() {
                             crate::platform::clipboard_set(&msg.text);
                         }
-                        ui.label(
-                            RichText::new(format!(
-                                "{} · {} tok",
-                                format_cost(cost),
-                                format_tokens(tokens)
-                            ))
-                            .size(10.5)
-                            .color(theme::MUTED),
-                        );
+                        if let (Some(cost), Some(tokens)) = (msg.cost, msg.tokens) {
+                            ui.label(
+                                RichText::new(format!(
+                                    "{} · {} tok",
+                                    format_cost(cost),
+                                    format_tokens(tokens)
+                                ))
+                                .size(9.5)
+                                .color(theme::MUTED),
+                            );
+                        }
                     });
                 }
             });
@@ -595,126 +682,91 @@ impl MuninnApp {
         ui.add_space(10.0);
     }
 
-    fn composer(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let mut submit = false;
-
-        ui.horizontal(|ui| {
+    fn empty_state(&mut self, ui: &mut Ui) {
+        ui.add_space((ui.available_height() * 0.16).clamp(24.0, 120.0));
+        ui.vertical_centered(|ui| {
+            ui.label(RichText::new("Чем помочь?").size(24.0).strong());
             ui.add_space(4.0);
             ui.label(
-                RichText::new(if self.deep_think {
-                    "deep think: on"
-                } else {
-                    "deep think: off"
-                })
-                .size(11.0)
-                .color(if self.deep_think {
-                    theme::ACCENT
-                } else {
-                    theme::MUTED
-                }),
-            );
-            ui.label(RichText::new("·").size(11.0).color(theme::MUTED));
-            ui.label(
-                RichText::new(if self.web { "web: on" } else { "web: off" })
-                    .size(11.0)
-                    .color(if self.web {
-                        theme::ACCENT
-                    } else {
-                        theme::MUTED
-                    }),
+                RichText::new("История, ветки и файлы остаются на устройстве.")
+                    .size(12.0)
+                    .color(theme::MUTED),
             );
         });
 
-        ui.add_space(6.0);
+        ui.add_space(20.0);
+        ui.horizontal_wrapped(|ui| {
+            let suggestions = ["Объясни код", "Составь план", "Переведи текст"];
+            for text in suggestions {
+                if suggestion_chip(ui, text).clicked() {
+                    self.draft = format!("{text}: ");
+                    ui.ctx()
+                        .memory_mut(|m| m.request_focus(Id::unique("composer")));
+                }
+            }
+        });
+    }
+
+    fn composer(&mut self, ui: &mut Ui, ctx: &egui::Context) {
+        let mut submit = false;
 
         egui::Frame::new()
             .fill(theme::CARD)
-            .corner_radius(22)
-            .stroke(egui::Stroke::new(1.0, theme::BORDER))
-            .inner_margin(Margin::symmetric(12, 8))
+            .corner_radius(20)
+            .stroke(Stroke::new(1.0, theme::BORDER))
+            .inner_margin(Margin::symmetric(10, 8))
             .show(ui, |ui| {
                 let edit = egui::TextEdit::multiline(&mut self.draft)
-                    .hint_text("Message Muninn…")
+                    .id(Id::unique("composer"))
+                    .hint_text("Сообщение…")
                     .desired_rows(1)
                     .desired_width(f32::INFINITY)
+                    .font(FontId::proportional(14.5))
                     .frame(egui::Frame::new())
-                    .margin(Margin::ZERO);
+                    .margin(Margin::symmetric(4, 6));
 
-                let resp = ui.add(edit);
+                let resp = ui.add_sized([ui.available_width(), 38.0], edit);
+                ime_sync(
+                    ui,
+                    &resp,
+                    &mut self.draft,
+                    &mut self.ime_focused,
+                    &mut self.composer_ime,
+                    true,
+                    false,
+                );
 
-                if resp.has_focus() {
-                    ctx.request_repaint_after(Duration::from_millis(50));
-                    if !self.ime_focused {
-                        crate::platform::set_ime_text(&self.draft, self.draft.len());
-                        self.ime_focused = true;
-                    } else if let Some(text) = crate::platform::ime_text()
-                        && text != self.draft
-                    {
-                        self.draft = text;
-                    }
-                } else if self.ime_focused {
-                    self.ime_focused = false;
-                }
-
-                let enter = resp.has_focus()
-                    && ctx.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
-                if enter {
+                if resp.has_focus()
+                    && ctx.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift)
+                {
                     submit = true;
                 }
 
-                ui.add_space(4.0);
+                ui.add_space(2.0);
 
                 ui.horizontal(|ui| {
-                    if ui
-                        .add(egui::Button::new(RichText::new("+").size(20.0)).frame(false))
-                        .clicked()
-                    {
+                    if plus_button(ui).clicked() {
                         // Attachments land here in M2.
                     }
-                    if ui
-                        .add(egui::Button::new(RichText::new("Mic").size(11.5)).frame(false))
-                        .clicked()
-                    {
+                    if mic_button(ui).clicked() {
                         // STT lands here in M2.
                     }
 
-                    if ui
-                        .selectable_label(self.deep_think, RichText::new("Deep think").size(12.0))
-                        .clicked()
-                    {
+                    ui.add_space(2.0);
+                    if toggle_pill(ui, "Think", self.deep_think) {
                         self.deep_think = !self.deep_think;
                     }
-                    if ui
-                        .selectable_label(self.web, RichText::new("Web").size(12.0))
-                        .clicked()
-                    {
+                    if toggle_pill(ui, "Web", self.web) {
                         self.web = !self.web;
                     }
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if self.streaming {
-                            let stop = egui::Button::new(
-                                RichText::new("Stop").size(12.0).color(theme::TEXT),
-                            )
-                            .fill(theme::CARD_HOVER)
-                            .corner_radius(CornerRadius::same(18))
-                            .min_size(Vec2::new(64.0, 36.0));
-                            if ui.add(stop).clicked() {
+                            if stop_button(ui).clicked() {
                                 self.stop();
                             }
-                        } else {
-                            let send = egui::Button::new(RichText::new("↑").size(17.0).strong())
-                                .fill(if self.draft.trim().is_empty() {
-                                    theme::CARD_HOVER
-                                } else {
-                                    theme::ACCENT
-                                })
-                                .corner_radius(CornerRadius::same(18))
-                                .min_size(Vec2::new(36.0, 36.0));
-
-                            if ui.add(send).clicked() {
-                                submit = true;
-                            }
+                        } else if send_button(ui, !self.draft.trim().is_empty()).clicked() {
+                            submit = true;
                         }
                     });
                 });
@@ -725,94 +777,29 @@ impl MuninnApp {
         }
     }
 
-    fn model_picker(&mut self, ctx: &egui::Context) {
-        if !self.model_menu {
-            return;
-        }
+    // ------------------------------------------------------------------
+    // Onboarding
+    // ------------------------------------------------------------------
 
-        let mut open = self.model_menu;
-        let mut chosen: Option<String> = None;
-
-        egui::Window::new("Models")
-            .open(&mut open)
-            .default_width(360.0)
-            .max_height(520.0)
-            .show(ctx, |ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.model_query)
-                        .hint_text("Search models…")
-                        .desired_width(f32::INFINITY),
-                );
-                ui.add_space(6.0);
-
-                let query = self.model_query.to_lowercase();
-                let indices: Vec<usize> = self
-                    .models
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, m)| {
-                        query.is_empty()
-                            || m.id.to_lowercase().contains(&query)
-                            || m.name.to_lowercase().contains(&query)
-                    })
-                    .map(|(i, _)| i)
-                    .collect();
-
-                ScrollArea::vertical()
-                    .max_height(420.0)
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        for idx in indices {
-                            let m = &self.models[idx];
-                            let selected = m.id == self.model;
-                            let label = format!(
-                                "{}  {}{}{}",
-                                if m.name.is_empty() { &m.id } else { &m.name },
-                                if m.free { "· free " } else { "" },
-                                if m.reasoning { "· think " } else { "" },
-                                if m.tools { "· tools" } else { "" },
-                            );
-
-                            let resp = ui.selectable_label(selected, label);
-                            if resp.clicked() {
-                                chosen = Some(m.id.clone());
-                            }
-                            resp.on_hover_text(format!(
-                                "{}\ncontext: {}\nprice: ${:.3}/M in · ${:.3}/M out",
-                                m.id,
-                                format_tokens(m.context),
-                                m.prompt_per_m,
-                                m.completion_per_m
-                            ));
-                        }
-                    });
-            });
-
-        if let Some(id) = chosen {
-            self.model = id;
-            open = false;
-        }
-        self.model_menu = open;
-    }
-
-    fn onboarding(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    fn onboarding(&mut self, ui: &mut Ui, ctx: &egui::Context) {
         ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                ui.add_space(48.0);
+                ui.add_space(44.0);
                 ui.vertical_centered(|ui| {
-                    ui.label(RichText::new("MUNINN").size(34.0).strong());
+                    ui.label(RichText::new("MUNINN").size(32.0).strong());
                     ui.add_space(4.0);
                     ui.label(
                         RichText::new("Приватный клиент OpenRouter")
-                            .size(14.0)
+                            .size(13.0)
                             .color(theme::MUTED),
                     );
                 });
 
-                ui.add_space(36.0);
+                ui.add_space(32.0);
+
+                let side = (ui.available_width() * 0.06).max(8.0);
                 ui.horizontal(|ui| {
-                    let side = (ui.available_width() * 0.08).max(8.0);
                     ui.add_space(side);
                     ui.vertical(|ui| {
                         ui.set_max_width((ui.available_width() - side).max(200.0));
@@ -823,11 +810,13 @@ impl MuninnApp {
                             .hint_text(OPENROUTER_BASE)
                             .margin(Margin::symmetric(12, 10));
                         let base_resp = ui.add(base);
-                        ime_into(
+                        ime_sync(
                             ui,
                             &base_resp,
                             &mut self.base_url,
                             &mut self.base_focus,
+                            &mut self.base_ime,
+                            false,
                             false,
                         );
 
@@ -840,11 +829,25 @@ impl MuninnApp {
                             .password(true)
                             .margin(Margin::symmetric(12, 10));
                         let key_resp = ui.add(key);
-                        ime_into(ui, &key_resp, &mut self.api_key, &mut self.key_focus, true);
+                        ime_sync(
+                            ui,
+                            &key_resp,
+                            &mut self.api_key,
+                            &mut self.key_focus,
+                            &mut self.key_ime,
+                            false,
+                            true,
+                        );
 
                         ui.add_space(8.0);
                         ui.horizontal(|ui| {
-                            if ui.button("Вставить из буфера").clicked()
+                            if ui
+                                .add(
+                                    egui::Button::new(RichText::new("Вставить ключ").size(12.0))
+                                        .fill(theme::CARD)
+                                        .corner_radius(10),
+                                )
+                                .clicked()
                                 && let Some(text) = crate::platform::clipboard_get()
                             {
                                 self.api_key = text.trim().to_owned();
@@ -855,10 +858,16 @@ impl MuninnApp {
                                     );
                                 }
                             }
-                            if ui.button("Вставить base URL").clicked()
-                                && let Some(text) = crate::platform::clipboard_get()
+
+                            if ui
+                                .add(
+                                    egui::Button::new(RichText::new("OpenRouter").size(12.0))
+                                        .fill(theme::CARD)
+                                        .corner_radius(10),
+                                )
+                                .clicked()
                             {
-                                self.base_url = text.trim().to_owned();
+                                self.base_url = OPENROUTER_BASE.to_owned();
                                 if self.base_focus {
                                     crate::platform::set_ime_text(
                                         &self.base_url,
@@ -868,39 +877,23 @@ impl MuninnApp {
                             }
                         });
 
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    RichText::new("Забыть сохранённый ключ")
-                                        .size(10.5)
-                                        .color(theme::MUTED),
-                                )
-                                .frame(false),
-                            )
-                            .clicked()
-                        {
-                            crate::secrets::clear();
-                            self.api_key.clear();
-                            self.error = None;
-                        }
-
                         ui.add_space(10.0);
                         ui.label(
                             RichText::new(
-                                "Ключ остаётся на устройстве. Без аккаунта и телеметрии.",
+                                "Ключ шифруется Android Keystore и не покидает устройство.",
                             )
                             .size(10.5)
                             .color(theme::MUTED),
                         );
                         ui.label(
                             RichText::new(
-                                "Бесплатные модели имеют лимиты. Ключ: openrouter.ai/keys",
+                                "Бесплатные модели лимитированы. Ключ: openrouter.ai/keys",
                             )
                             .size(10.5)
                             .color(theme::MUTED),
                         );
 
-                        ui.add_space(18.0);
+                        ui.add_space(16.0);
 
                         let can_connect = !self.connecting && !self.api_key.trim().is_empty();
                         if ui
@@ -912,7 +905,7 @@ impl MuninnApp {
                                     } else {
                                         "Подключиться"
                                     })
-                                    .size(15.0),
+                                    .size(14.5),
                                 )
                                 .fill(if can_connect {
                                     theme::ACCENT
@@ -924,6 +917,7 @@ impl MuninnApp {
                             )
                             .clicked()
                         {
+                            hide_keyboard(ctx);
                             self.connect(ctx);
                         }
 
@@ -933,7 +927,7 @@ impl MuninnApp {
                                 ui.spinner();
                                 ui.label(
                                     RichText::new("проверяю ключ и загружаю модели")
-                                        .size(11.5)
+                                        .size(11.0)
                                         .color(theme::MUTED),
                                 );
                             });
@@ -941,19 +935,245 @@ impl MuninnApp {
 
                         if let Some(error) = &self.error {
                             ui.add_space(10.0);
-                            ui.label(RichText::new(error).size(12.0).color(theme::DANGER));
+                            ui.label(RichText::new(error).size(11.5).color(theme::DANGER));
+                        }
+
+                        ui.add_space(8.0);
+                        if link_button(ui, "Забыть сохранённый ключ").clicked()
+                        {
+                            crate::secrets::clear();
+                            self.api_key.clear();
+                            self.error = None;
                         }
                     });
                 });
-                ui.add_space(48.0);
+
+                ui.add_space(40.0);
             });
+    }
+
+    // ------------------------------------------------------------------
+    // Bottom sheets
+    // ------------------------------------------------------------------
+
+    fn sheets(&mut self, ctx: &egui::Context, screen: Rect, insets: Insets) {
+        if self.sheet == Sheet::None {
+            return;
+        }
+
+        let bottom = screen.bottom() - insets.bottom;
+        let max_h = (bottom - screen.top() - 16.0).max(220.0);
+        let wanted = match self.sheet {
+            Sheet::Models => screen.height() * 0.72,
+            Sheet::Menu => 300.0,
+            Sheet::None => 0.0,
+        };
+        let height = wanted.min(620.0).min(max_h);
+        let rect = Rect::from_min_max(
+            Pos2::new(screen.left(), bottom - height),
+            Pos2::new(screen.right(), bottom),
+        );
+
+        let mut dismiss = false;
+        egui::Area::new(Id::unique("sheet_overlay"))
+            .order(egui::Order::Middle)
+            .fixed_pos(screen.min)
+            .show(ctx, |ui| {
+                let (r, resp) = ui.allocate_exact_size(screen.size(), Sense::click());
+                ui.painter()
+                    .rect_filled(r, 0, Color32::from_black_alpha(150));
+                if resp.clicked() {
+                    dismiss = true;
+                }
+            });
+
+        let mut close = false;
+        egui::Area::new(Id::unique("sheet"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(rect.min)
+            .show(ctx, |ui| {
+                ui.set_width(rect.width());
+                ui.set_height(rect.height());
+                ui.set_clip_rect(rect);
+                egui::Frame::new()
+                    .fill(theme::SURFACE)
+                    .corner_radius(CornerRadius {
+                        nw: 24,
+                        ne: 24,
+                        sw: 0,
+                        se: 0,
+                    })
+                    .inner_margin(Margin {
+                        left: 16,
+                        right: 16,
+                        top: 8,
+                        bottom: 12,
+                    })
+                    .show(ui, |ui| {
+                        let (handle, _) = ui.allocate_exact_size(
+                            Vec2::new(ui.available_width(), 14.0),
+                            Sense::hover(),
+                        );
+                        ui.painter().rect_filled(
+                            Rect::from_center_size(handle.center(), Vec2::new(36.0, 4.0)),
+                            2,
+                            theme::BORDER,
+                        );
+
+                        match self.sheet {
+                            Sheet::Models => self.models_sheet(ui, &mut close),
+                            Sheet::Menu => self.menu_sheet(ui, &mut close),
+                            Sheet::None => {}
+                        }
+                    });
+            });
+
+        if dismiss || close {
+            self.close_sheet(ctx);
+        }
+    }
+
+    fn models_sheet(&mut self, ui: &mut Ui, close: &mut bool) {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Модели").size(18.0).strong());
+            ui.label(
+                RichText::new(format!("{}", self.models.len()))
+                    .size(10.0)
+                    .color(theme::MUTED),
+            );
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if close_button(ui).clicked() {
+                    *close = true;
+                }
+            });
+        });
+
+        ui.add_space(8.0);
+
+        let search = egui::TextEdit::singleline(&mut self.model_query)
+            .hint_text("Поиск по названию или id…")
+            .desired_width(f32::INFINITY)
+            .margin(Margin::symmetric(12, 9));
+        let resp = ui.add(search);
+        ime_sync(
+            ui,
+            &resp,
+            &mut self.model_query,
+            &mut self.model_search_focus,
+            &mut self.search_ime,
+            false,
+            false,
+        );
+
+        ui.add_space(8.0);
+        ui.horizontal_wrapped(|ui| {
+            for filter in [
+                ModelFilter::All,
+                ModelFilter::Free,
+                ModelFilter::Think,
+                ModelFilter::Tools,
+                ModelFilter::Vision,
+            ] {
+                if filter_chip(ui, filter.label(), self.model_filter == filter).clicked() {
+                    self.model_filter = filter;
+                }
+            }
+        });
+
+        ui.add_space(6.0);
+
+        let indices = self.filtered_models();
+        ui.label(
+            RichText::new(format!("{} моделей", indices.len()))
+                .size(10.0)
+                .color(theme::MUTED),
+        );
+        ui.add_space(4.0);
+
+        let list_height = (ui.available_height() - 6.0).max(120.0);
+        let mut chosen: Option<String> = None;
+
+        ui.scope(|ui| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .max_height(list_height)
+                .show_rows(ui, 64.0, indices.len(), |ui, range| {
+                    for i in range {
+                        let idx = indices[i];
+                        let model = &self.models[idx];
+                        let selected = model.id == self.model;
+                        let row = model_row(ui, model, selected, ui.available_width());
+                        if row.clicked() {
+                            chosen = Some(model.id.clone());
+                        }
+                    }
+                });
+        });
+
+        if let Some(id) = chosen {
+            self.model = id;
+            *close = true;
+        }
+    }
+
+    fn filtered_models(&self) -> Vec<usize> {
+        let query = self.model_query.trim().to_lowercase();
+
+        self.models
+            .iter()
+            .enumerate()
+            .filter(|(_, model)| {
+                let matches_query = query.is_empty()
+                    || model.id.to_lowercase().contains(&query)
+                    || model.name.to_lowercase().contains(&query);
+                matches_query && self.model_filter.accepts(model)
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    fn menu_sheet(&mut self, ui: &mut Ui, close: &mut bool) {
+        let ctx = ui.ctx().clone();
+
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Muninn").size(18.0).strong());
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if close_button(ui).clicked() {
+                    *close = true;
+                }
+            });
+        });
+
+        ui.add_space(10.0);
+
+        if menu_row(ui, "Новый чат", "Очистить текущий разговор").clicked()
+        {
+            self.new_chat(&ctx);
+            *close = true;
+        }
+        if menu_row(ui, "Сменить ключ", "Keystore и автоподключение").clicked()
+        {
+            self.change_key(&ctx);
+            *close = true;
+        }
+        if menu_row(ui, "Настройки", "темы, память, агент — в следующих сборках").clicked()
+        {
+            // Reserved.
+        }
     }
 }
 
 impl eframe::App for MuninnApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         self.drain_events(ui.ctx());
 
+        if crate::platform::take_back_requested() && self.sheet != Sheet::None {
+            self.close_sheet(ui.ctx());
+        }
+        crate::platform::set_back_handled(self.sheet != Sheet::None);
+
+        let screen = ui.max_rect();
         let insets = crate::platform::system_insets(ui);
 
         if insets.top > 0.5 {
@@ -987,11 +1207,12 @@ impl eframe::App for MuninnApp {
             }
             Screen::Chat => {
                 egui::Panel::top("muninn_header")
-                    .exact_size(58.0)
+                    .exact_size(56.0)
+                    .show_separator_line(true)
                     .frame(
                         egui::Frame::new()
                             .fill(theme::SURFACE)
-                            .inner_margin(Margin::symmetric(14, 8)),
+                            .inner_margin(Margin::symmetric(12, 8)),
                     )
                     .show(ui, |ui| self.header(ui));
 
@@ -1014,37 +1235,23 @@ impl eframe::App for MuninnApp {
                             .auto_shrink([false, false])
                             .stick_to_bottom(true)
                             .show(ui, |ui| {
-                                ui.add_space(12.0);
+                                ui.add_space(10.0);
 
                                 if self.messages.is_empty() {
-                                    ui.add_space(ui.available_height() * 0.12);
-                                    ui.vertical_centered(|ui| {
-                                        ui.label(
-                                            RichText::new("MUNINN")
-                                                .size(30.0)
-                                                .strong()
-                                                .color(theme::TEXT),
-                                        );
-                                        ui.add_space(4.0);
-                                        ui.label(
-                                            RichText::new("Память. Ветки. Агент.")
-                                                .size(13.0)
-                                                .color(theme::MUTED),
-                                        );
-                                    });
+                                    self.empty_state(ui);
                                 }
 
                                 for msg in &self.messages {
                                     self.bubble(ui, msg);
                                 }
 
-                                ui.add_space(6.0);
+                                ui.add_space(4.0);
                             });
                     });
-
-                self.model_picker(&ctx);
             }
         }
+
+        self.sheets(&ctx, screen, insets);
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
@@ -1059,37 +1266,452 @@ impl eframe::App for MuninnApp {
 }
 
 // ----------------------------------------------------------------------
+// Widgets
+// ----------------------------------------------------------------------
+
+fn menu_button(ui: &mut Ui) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(34.0), Sense::click());
+    let color = if resp.hovered() {
+        theme::TEXT
+    } else {
+        theme::MUTED
+    };
+    if resp.hovered() {
+        ui.painter().rect_filled(rect, 10, theme::CARD_HOVER);
+    }
+    let p = ui.painter();
+    let c = rect.center();
+    for dy in [-5.0, 0.0, 5.0] {
+        p.line_segment(
+            [
+                Pos2::new(c.x - 7.0, c.y + dy),
+                Pos2::new(c.x + 7.0, c.y + dy),
+            ],
+            Stroke::new(1.5, color),
+        );
+    }
+    resp
+}
+
+fn close_button(ui: &mut Ui) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(32.0), Sense::click());
+    let color = if resp.hovered() {
+        theme::TEXT
+    } else {
+        theme::MUTED
+    };
+    if resp.hovered() {
+        ui.painter().rect_filled(rect, 9, theme::CARD_HOVER);
+    }
+    let c = rect.center();
+    let p = ui.painter();
+    p.line_segment(
+        [
+            Pos2::new(c.x - 5.0, c.y - 5.0),
+            Pos2::new(c.x + 5.0, c.y + 5.0),
+        ],
+        Stroke::new(1.5, color),
+    );
+    p.line_segment(
+        [
+            Pos2::new(c.x + 5.0, c.y - 5.0),
+            Pos2::new(c.x - 5.0, c.y + 5.0),
+        ],
+        Stroke::new(1.5, color),
+    );
+    resp
+}
+
+fn plus_button(ui: &mut Ui) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(30.0), Sense::click());
+    let color = if resp.hovered() {
+        theme::TEXT
+    } else {
+        theme::MUTED
+    };
+    if resp.hovered() {
+        ui.painter().rect_filled(rect, 9, theme::CARD_HOVER);
+    }
+    let c = rect.center();
+    let p = ui.painter();
+    p.line_segment(
+        [Pos2::new(c.x - 6.0, c.y), Pos2::new(c.x + 6.0, c.y)],
+        Stroke::new(1.5, color),
+    );
+    p.line_segment(
+        [Pos2::new(c.x, c.y - 6.0), Pos2::new(c.x, c.y + 6.0)],
+        Stroke::new(1.5, color),
+    );
+    resp
+}
+
+fn mic_button(ui: &mut Ui) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(30.0), Sense::click());
+    let color = if resp.hovered() {
+        theme::TEXT
+    } else {
+        theme::MUTED
+    };
+    if resp.hovered() {
+        ui.painter().rect_filled(rect, 9, theme::CARD_HOVER);
+    }
+    let c = rect.center();
+    let p = ui.painter();
+    p.rect_filled(
+        Rect::from_center_size(Pos2::new(c.x, c.y - 2.0), Vec2::new(6.0, 10.0)),
+        3,
+        color,
+    );
+    p.line_segment(
+        [
+            Pos2::new(c.x - 4.0, c.y + 2.0),
+            Pos2::new(c.x - 4.0, c.y + 4.0),
+        ],
+        Stroke::new(1.4, color),
+    );
+    p.line_segment(
+        [
+            Pos2::new(c.x + 4.0, c.y + 2.0),
+            Pos2::new(c.x + 4.0, c.y + 4.0),
+        ],
+        Stroke::new(1.4, color),
+    );
+    p.line_segment(
+        [
+            Pos2::new(c.x - 4.0, c.y + 4.0),
+            Pos2::new(c.x + 4.0, c.y + 4.0),
+        ],
+        Stroke::new(1.4, color),
+    );
+    p.line_segment(
+        [Pos2::new(c.x, c.y + 4.0), Pos2::new(c.x, c.y + 7.0)],
+        Stroke::new(1.4, color),
+    );
+    resp
+}
+
+fn send_button(ui: &mut Ui, enabled: bool) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(34.0), Sense::click());
+    let fill = if enabled {
+        theme::ACCENT
+    } else {
+        theme::CARD_HOVER
+    };
+    ui.painter().circle_filled(rect.center(), 17.0, fill);
+    let color = if enabled {
+        Color32::WHITE
+    } else {
+        theme::MUTED
+    };
+    let c = rect.center();
+    let p = ui.painter();
+    p.line_segment(
+        [Pos2::new(c.x, c.y + 6.0), Pos2::new(c.x, c.y - 6.0)],
+        Stroke::new(1.7, color),
+    );
+    p.line_segment(
+        [Pos2::new(c.x - 4.0, c.y - 2.0), Pos2::new(c.x, c.y - 6.0)],
+        Stroke::new(1.7, color),
+    );
+    p.line_segment(
+        [Pos2::new(c.x + 4.0, c.y - 2.0), Pos2::new(c.x, c.y - 6.0)],
+        Stroke::new(1.7, color),
+    );
+    resp
+}
+
+fn stop_button(ui: &mut Ui) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(62.0, 32.0), Sense::click());
+    ui.painter().rect_filled(rect, 16, theme::CARD_HOVER);
+    let p = ui.painter();
+    p.rect_filled(
+        Rect::from_center_size(rect.center(), Vec2::new(9.0, 9.0)),
+        2,
+        theme::TEXT,
+    );
+    resp
+}
+
+fn toggle_pill(ui: &mut Ui, label: &str, active: bool) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(56.0, 26.0), Sense::click());
+    let fill = if active {
+        theme::ACCENT_SOFT
+    } else if resp.hovered() {
+        theme::CARD_HOVER
+    } else {
+        Color32::TRANSPARENT
+    };
+    let stroke = if active {
+        Stroke::NONE
+    } else {
+        Stroke::new(1.0, theme::BORDER)
+    };
+    ui.painter()
+        .rect(rect, 13, fill, stroke, egui::StrokeKind::Inside);
+    ui.painter().text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        label,
+        FontId::proportional(10.5),
+        if active { theme::ACCENT } else { theme::MUTED },
+    );
+    resp.clicked()
+}
+
+fn filter_chip(ui: &mut Ui, label: &str, active: bool) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(58.0, 26.0), Sense::click());
+    let fill = if active {
+        theme::ACCENT_SOFT
+    } else if resp.hovered() {
+        theme::CARD_HOVER
+    } else {
+        Color32::TRANSPARENT
+    };
+    let stroke = if active {
+        Stroke::NONE
+    } else {
+        Stroke::new(1.0, theme::BORDER)
+    };
+    ui.painter()
+        .rect(rect, 13, fill, stroke, egui::StrokeKind::Inside);
+    ui.painter().text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        label,
+        FontId::proportional(10.5),
+        if active { theme::ACCENT } else { theme::MUTED },
+    );
+    resp
+}
+
+fn suggestion_chip(ui: &mut Ui, label: &str) -> egui::Response {
+    let width = 96.0;
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 34.0), Sense::click());
+    let fill = if resp.hovered() {
+        theme::CARD_HOVER
+    } else {
+        theme::CARD
+    };
+    ui.painter().rect_filled(rect, 17, fill);
+    ui.painter().text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        label,
+        FontId::proportional(11.0),
+        theme::TEXT,
+    );
+    resp
+}
+
+fn model_chip(ui: &mut Ui, label: &str, width: f32) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 32.0), Sense::click());
+    let fill = if resp.hovered() {
+        theme::CARD_HOVER
+    } else {
+        theme::CARD
+    };
+    ui.painter().rect_filled(rect, 16, fill);
+    let p = ui.painter().with_clip_rect(rect);
+    p.text(
+        Pos2::new(rect.left() + 12.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        truncate(label, 19),
+        FontId::proportional(12.0),
+        theme::TEXT,
+    );
+    let c = Pos2::new(rect.right() - 14.0, rect.center().y - 1.0);
+    p.line_segment(
+        [Pos2::new(c.x - 3.0, c.y - 2.0), Pos2::new(c.x, c.y + 2.0)],
+        Stroke::new(1.4, theme::MUTED),
+    );
+    p.line_segment(
+        [Pos2::new(c.x + 3.0, c.y - 2.0), Pos2::new(c.x, c.y + 2.0)],
+        Stroke::new(1.4, theme::MUTED),
+    );
+    resp
+}
+
+fn model_row(ui: &mut Ui, model: &ModelEntry, selected: bool, width: f32) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 64.0), Sense::click());
+    let fill = if selected {
+        theme::ACCENT_SOFT
+    } else if resp.hovered() {
+        theme::CARD_HOVER
+    } else {
+        Color32::TRANSPARENT
+    };
+    if fill != Color32::TRANSPARENT {
+        ui.painter().rect_filled(rect.shrink(2.0), 12, fill);
+    }
+
+    let p = ui.painter().with_clip_rect(rect);
+    let name = if model.name.is_empty() {
+        &model.id
+    } else {
+        &model.name
+    };
+
+    p.text(
+        Pos2::new(rect.left() + 12.0, rect.top() + 9.0),
+        Align2::LEFT_TOP,
+        truncate(name, 30),
+        FontId::proportional(13.5),
+        theme::TEXT,
+    );
+    p.text(
+        Pos2::new(rect.left() + 12.0, rect.top() + 28.0),
+        Align2::LEFT_TOP,
+        truncate(&model.id, 38),
+        FontId::proportional(9.5),
+        theme::MUTED,
+    );
+
+    let mut badges = Vec::new();
+    if model.free {
+        badges.push("free");
+    }
+    if model.reasoning {
+        badges.push("think");
+    }
+    if model.tools {
+        badges.push("tools");
+    }
+    if model.vision {
+        badges.push("vision");
+    }
+    p.text(
+        Pos2::new(rect.left() + 12.0, rect.top() + 45.0),
+        Align2::LEFT_TOP,
+        badges.join(" · "),
+        FontId::proportional(9.0),
+        if selected {
+            theme::ACCENT
+        } else {
+            theme::MUTED
+        },
+    );
+
+    let price = if model.free {
+        "free".to_owned()
+    } else {
+        format!("${:.2}/M", model.prompt_per_m)
+    };
+    p.text(
+        Pos2::new(rect.right() - 12.0, rect.top() + 9.0),
+        Align2::RIGHT_TOP,
+        price,
+        FontId::proportional(10.0),
+        if model.free {
+            theme::ACCENT
+        } else {
+            theme::MUTED
+        },
+    );
+    p.text(
+        Pos2::new(rect.right() - 12.0, rect.top() + 28.0),
+        Align2::RIGHT_TOP,
+        format!("{} ctx", format_tokens(model.context)),
+        FontId::proportional(9.0),
+        theme::MUTED,
+    );
+
+    resp
+}
+
+fn menu_row(ui: &mut Ui, title: &str, subtitle: &str) -> egui::Response {
+    let width = ui.available_width();
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 58.0), Sense::click());
+    if resp.hovered() {
+        ui.painter()
+            .rect_filled(rect.shrink(2.0), 12, theme::CARD_HOVER);
+    }
+    let p = ui.painter().with_clip_rect(rect);
+    p.text(
+        Pos2::new(rect.left() + 12.0, rect.top() + 10.0),
+        Align2::LEFT_TOP,
+        title,
+        FontId::proportional(14.0),
+        theme::TEXT,
+    );
+    p.text(
+        Pos2::new(rect.left() + 12.0, rect.top() + 30.0),
+        Align2::LEFT_TOP,
+        subtitle,
+        FontId::proportional(9.5),
+        theme::MUTED,
+    );
+    resp
+}
+
+fn link_button(ui: &mut Ui, label: &str) -> egui::Response {
+    let galley =
+        ui.painter()
+            .layout_no_wrap(label.to_owned(), FontId::proportional(9.5), theme::MUTED);
+    let (rect, resp) =
+        ui.allocate_exact_size(Vec2::new(galley.size().x + 4.0, 18.0), Sense::click());
+    ui.painter().galley(
+        Pos2::new(rect.left() + 2.0, rect.center().y - galley.size().y * 0.5),
+        galley,
+        theme::MUTED,
+    );
+    resp
+}
+
+// ----------------------------------------------------------------------
 // Helpers
 // ----------------------------------------------------------------------
 
-fn field_label(ui: &mut egui::Ui, text: &str) {
-    ui.label(RichText::new(text).size(10.0).color(theme::MUTED).strong());
+fn field_label(ui: &mut Ui, text: &str) {
+    ui.label(RichText::new(text).size(9.5).color(theme::MUTED).strong());
     ui.add_space(2.0);
 }
 
-/// Mirror the Android IME text state into a text field.
-fn ime_into(
-    ui: &egui::Ui,
+/// Mirror the Android IME text state into a field.
+///
+/// `last_ime` is what the IME reported last. A difference means the IME edited
+/// the text; if only `text` changed, egui (hardware keyboard) edited it and we
+/// push it back so the next soft-key event has the same buffer.
+fn ime_sync(
+    ui: &Ui,
     resp: &egui::Response,
     text: &mut String,
     focused: &mut bool,
-    secret: bool,
+    last_ime: &mut String,
+    multiline: bool,
+    password: bool,
 ) {
     if resp.has_focus() {
         ui.ctx().request_repaint_after(Duration::from_millis(50));
+
         if !*focused {
+            crate::platform::configure_ime(multiline, password);
             crate::platform::set_ime_text(text, text.len());
+            *last_ime = text.clone();
             *focused = true;
-        } else if let Some(ime) = crate::platform::ime_text()
-            && ime != *text
-        {
-            *text = ime;
+            return;
+        }
+
+        if let Some(ime) = crate::platform::ime_text() {
+            if ime != *last_ime {
+                *last_ime = ime.clone();
+                if ime != *text {
+                    *text = ime;
+                }
+            } else if *text != *last_ime {
+                crate::platform::set_ime_text(text, text.len());
+                *last_ime = text.clone();
+            }
         }
     } else if *focused {
         *focused = false;
     }
+}
 
-    let _ = secret;
+fn hide_keyboard(ctx: &egui::Context) {
+    if let Some(id) = ctx.memory(|m| m.focused()) {
+        ctx.memory_mut(|m| m.surrender_focus(id));
+    }
+    ctx.send_viewport_cmd(egui::ViewportCommand::IMEAllowed(false));
 }
 
 fn truncate(text: &str, max: usize) -> String {

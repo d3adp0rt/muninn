@@ -8,16 +8,17 @@ use egui::{
     InsertFontFamily, TextStyle, Vec2, Visuals,
 };
 
-pub const BG: Color32 = Color32::from_rgb(11, 12, 16);
-pub const SURFACE: Color32 = Color32::from_rgb(17, 18, 24);
-pub const CARD: Color32 = Color32::from_rgb(24, 25, 33);
-pub const CARD_HOVER: Color32 = Color32::from_rgb(33, 34, 45);
-pub const ACCENT: Color32 = Color32::from_rgb(124, 92, 255);
-pub const ACCENT_SOFT: Color32 = Color32::from_rgba_premultiplied(58, 42, 120, 255);
-pub const TEXT: Color32 = Color32::from_rgb(233, 234, 239);
-pub const MUTED: Color32 = Color32::from_rgb(148, 151, 163);
-pub const BORDER: Color32 = Color32::from_rgb(38, 39, 49);
-pub const DANGER: Color32 = Color32::from_rgb(255, 112, 112);
+pub const BG: Color32 = Color32::from_rgb(10, 11, 15);
+pub const SURFACE: Color32 = Color32::from_rgb(16, 17, 22);
+pub const CARD: Color32 = Color32::from_rgb(23, 24, 31);
+pub const CARD_HOVER: Color32 = Color32::from_rgb(32, 34, 43);
+pub const ACCENT: Color32 = Color32::from_rgb(108, 92, 231);
+pub const ACCENT_SOFT: Color32 = Color32::from_rgb(43, 38, 78);
+pub const TEXT: Color32 = Color32::from_rgb(236, 237, 242);
+pub const MUTED: Color32 = Color32::from_rgb(138, 143, 158);
+pub const BORDER: Color32 = Color32::from_rgb(37, 39, 49);
+pub const DANGER: Color32 = Color32::from_rgb(255, 110, 110);
+pub const USER_BUBBLE: Color32 = Color32::from_rgb(45, 42, 70);
 
 pub fn apply(ctx: &egui::Context) {
     install_fonts(ctx);
@@ -45,13 +46,14 @@ pub fn apply(ctx: &egui::Context) {
 
     style.visuals = v;
     style.spacing.item_spacing = Vec2::new(8.0, 8.0);
-    style.spacing.button_padding = Vec2::new(12.0, 8.0);
+    style.spacing.button_padding = Vec2::new(10.0, 7.0);
+    style.spacing.interact_size = Vec2::new(36.0, 36.0);
     style.text_styles = [
         (
             TextStyle::Heading,
             FontId::new(22.0, FontFamily::Proportional),
         ),
-        (TextStyle::Body, FontId::new(15.5, FontFamily::Proportional)),
+        (TextStyle::Body, FontId::new(14.5, FontFamily::Proportional)),
         (
             TextStyle::Button,
             FontId::new(14.5, FontFamily::Proportional),

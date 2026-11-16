@@ -3,10 +3,12 @@ package io.github.d3adp0rt.muninn;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.graphics.Color;
+import android.os.Build;
 import android.os.Bundle;
 import android.security.keystore.KeyGenParameterSpec;
 import android.security.keystore.KeyProperties;
 import android.view.View;
+import android.window.OnBackInvokedDispatcher;
 
 import androidx.core.graphics.Insets;
 import androidx.core.view.WindowCompat;
@@ -34,6 +36,8 @@ public class MainActivity extends GameActivity {
 
     private native void nativeInsets(int top, int bottom, int left, int right);
 
+    private native boolean nativeBack();
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         WindowCompat.setDecorFitsSystemWindows(getWindow(), false);
@@ -47,6 +51,24 @@ public class MainActivity extends GameActivity {
         controller.setAppearanceLightNavigationBars(false);
 
         super.onCreate(savedInstanceState);
+
+        if (Build.VERSION.SDK_INT >= 33) {
+            getOnBackInvokedDispatcher().registerOnBackInvokedCallback(
+                    OnBackInvokedDispatcher.PRIORITY_DEFAULT,
+                    () -> {
+                        if (!nativeBack()) {
+                            finish();
+                        }
+                    });
+        }
+    }
+
+    @Override
+    @SuppressWarnings("deprecation")
+    public void onBackPressed() {
+        if (!nativeBack()) {
+            super.onBackPressed();
+        }
     }
 
     @Override

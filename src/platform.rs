@@ -43,6 +43,9 @@ mod android {
     use jni::objects::GlobalRef;
 
     static ACTIVITY: OnceLock<GlobalRef> = OnceLock::new();
+    static BACK_REQUESTED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    static BACK_HANDLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
     pub fn init_activity(app: &winit::platform::android::activity::AndroidApp) {
         use jni::{JavaVM, objects::JObject};
@@ -69,6 +72,26 @@ mod android {
     pub(super) static LEFT: AtomicI32 = AtomicI32::new(0);
     pub(super) static RIGHT: AtomicI32 = AtomicI32::new(0);
 
+    /// Called from `MainActivity.onBackPressed`.
+    ///
+    /// Returns `true` if the UI wants to consume the event (a sheet is open).
+    #[unsafe(no_mangle)]
+    pub extern "system" fn Java_io_github_d3adp0rt_muninn_MainActivity_nativeBack(
+        _env: *mut core::ffi::c_void,
+        _this: *mut core::ffi::c_void,
+    ) -> u8 {
+        BACK_REQUESTED.store(true, Relaxed);
+        BACK_HANDLED.load(Relaxed) as u8
+    }
+
+    pub fn take_back_requested() -> bool {
+        BACK_REQUESTED.swap(false, Relaxed)
+    }
+
+    pub fn set_back_handled(value: bool) {
+        BACK_HANDLED.store(value, Relaxed);
+    }
+
     /// Called from `MainActivity.onApplyWindowInsets`.
     #[unsafe(no_mangle)]
     pub extern "system" fn Java_io_github_d3adp0rt_muninn_MainActivity_nativeInsets(
@@ -83,6 +106,30 @@ mod android {
         BOTTOM.store(bottom, Relaxed);
         LEFT.store(left, Relaxed);
         RIGHT.store(right, Relaxed);
+    }
+
+    /// Configure the soft keyboard for the field that just gained focus.
+    pub fn configure_ime(multiline: bool, password: bool) {
+        use android_activity::input::{ImeOptions, InputType, TextInputAction};
+
+        let Some(app) = crate::ANDROID_APP.get() else {
+            return;
+        };
+
+        let mut input_type = InputType::TYPE_CLASS_TEXT
+            | InputType::TYPE_TEXT_FLAG_NO_SUGGESTIONS
+            | InputType::TYPE_TEXT_FLAG_CAP_SENTENCES;
+        if multiline {
+            input_type |= InputType::TYPE_TEXT_FLAG_MULTI_LINE;
+        }
+        if password {
+            input_type |= InputType::TYPE_TEXT_VARIATION_PASSWORD;
+        }
+
+        let options =
+            ImeOptions::IME_FLAG_NO_FULLSCREEN | ImeOptions::IME_FLAG_NO_PERSONALIZED_LEARNING;
+
+        app.set_ime_editor_info(input_type, TextInputAction::None, options);
     }
 
     /// Current text state as seen by the Android IME.
@@ -111,12 +158,25 @@ mod android {
 }
 
 #[cfg(target_os = "android")]
-pub use android::{ime_text, init_activity, set_ime_text};
+pub use android::{
+    configure_ime, ime_text, init_activity, set_back_handled, set_ime_text, take_back_requested,
+};
 
 #[cfg(not(target_os = "android"))]
 pub fn ime_text() -> Option<String> {
     None
 }
+
+#[cfg(not(target_os = "android"))]
+pub fn configure_ime(_multiline: bool, _password: bool) {}
+
+#[cfg(not(target_os = "android"))]
+pub fn take_back_requested() -> bool {
+    false
+}
+
+#[cfg(not(target_os = "android"))]
+pub fn set_back_handled(_value: bool) {}
 
 #[cfg(not(target_os = "android"))]
 pub fn set_ime_text(_text: &str, _cursor_bytes: usize) {}
