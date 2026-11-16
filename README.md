@@ -2,9 +2,9 @@
 
 A private, local-first OpenRouter client for Android, written in Rust.
 
-> M0 is done: egui + GameActivity + wgpu on device, IME bridge, insets,
-> encrypted key storage and streaming chat work. History, branches, markdown
-> and the agent are next.
+> M0/M1 in progress: egui + GameActivity + wgpu, IME + caret sync, encrypted
+> key and chat history, streaming markdown chat, thread drawer, and
+> Dark/AMOLED/Light themes with a tokenized design system.
 
 ## What it will be
 

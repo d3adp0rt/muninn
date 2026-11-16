@@ -1276,8 +1276,7 @@ impl MuninnApp {
             .fixed_pos(screen.min)
             .show(ctx, |ui| {
                 let (r, resp) = ui.allocate_exact_size(screen.size(), Sense::click());
-                ui.painter()
-                    .rect_filled(r, 0, Color32::from_black_alpha(150));
+                ui.painter().rect_filled(r, 0, theme::c().scrim);
                 if resp.clicked() {
                     dismiss = true;
                 }
@@ -1938,12 +1937,15 @@ fn send_button(ui: &mut Ui, enabled: bool) -> egui::Response {
 }
 
 fn stop_button(ui: &mut Ui) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(62.0, 32.0), Sense::click());
-    ui.painter()
-        .rect_filled(rect, 16, theme::c().surface_overlay);
-    let p = ui.painter();
-    p.rect_filled(
-        Rect::from_center_size(rect.center(), Vec2::new(9.0, 9.0)),
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(44.0), Sense::click());
+    let fill = if resp.hovered() {
+        theme::c().border_strong
+    } else {
+        theme::c().surface_overlay
+    };
+    ui.painter().circle_filled(rect.center(), 22.0, fill);
+    ui.painter().rect_filled(
+        egui::Rect::from_center_size(rect.center(), Vec2::splat(12.0)),
         2,
         theme::c().text,
     );
