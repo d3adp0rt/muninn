@@ -90,3 +90,43 @@ pub fn clear() {
         let _ = std::fs::remove_file(path);
     }
 }
+
+fn blob_path(name: &str) -> Option<PathBuf> {
+    #[cfg(target_os = "android")]
+    {
+        crate::ANDROID_APP
+            .get()?
+            .internal_data_path()
+            .map(|dir| dir.join(name))
+    }
+
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = name;
+        None
+    }
+}
+
+/// Encrypt an arbitrary blob with the Keystore key and write it atomically.
+pub fn save_blob(name: &str, data: &[u8]) -> bool {
+    let Some(path) = blob_path(name) else {
+        return false;
+    };
+    let Some(blob) = crate::platform::keystore_seal(data) else {
+        log::warn!("secrets: seal failed for {name}");
+        return false;
+    };
+
+    let tmp = path.with_extension("tmp");
+    if std::fs::write(&tmp, &blob).is_err() {
+        return false;
+    }
+    std::fs::rename(tmp, path).is_ok()
+}
+
+/// Read and decrypt a blob previously written by [`save_blob`].
+pub fn load_blob(name: &str) -> Option<Vec<u8>> {
+    let path = blob_path(name)?;
+    let blob = std::fs::read(path).ok()?;
+    crate::platform::keystore_open(&blob)
+}

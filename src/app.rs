@@ -20,6 +20,7 @@ use crate::api::{
 };
 use crate::platform::Insets;
 use crate::theme;
+use serde::{Deserialize, Serialize};
 
 pub const OPENROUTER_BASE: &str = "https://openrouter.ai/api/v1";
 
@@ -48,6 +49,9 @@ pub struct MuninnApp {
     model_search_focus: bool,
     model_filter: ModelFilter,
 
+    chats: Vec<ChatSnapshot>,
+    active: usize,
+
     title: String,
     messages: Vec<Message>,
     draft: String,
@@ -73,6 +77,7 @@ enum Screen {
 enum Sheet {
     None,
     Models,
+    Chats,
     Menu,
 }
 
@@ -118,6 +123,7 @@ struct ModelEntry {
     free: bool,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
 struct Message {
     role: Role,
     text: String,
@@ -126,6 +132,23 @@ struct Message {
     tokens: Option<u64>,
     streaming: bool,
     error: bool,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct ChatSnapshot {
+    id: u64,
+    title: String,
+    model: String,
+    cost: f64,
+    tokens: u64,
+    updated_at: u64,
+    messages: Vec<Message>,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct Workspace {
+    chats: Vec<ChatSnapshot>,
+    active: usize,
 }
 
 enum UiEvent {
@@ -167,6 +190,8 @@ impl MuninnApp {
             model_query: String::new(),
             model_search_focus: false,
             model_filter: ModelFilter::All,
+            chats: Vec::new(),
+            active: 0,
             title: "Новый чат".to_owned(),
             messages: Vec::new(),
             draft: String::new(),
@@ -180,6 +205,8 @@ impl MuninnApp {
             rx,
             stream_task: None,
         };
+
+        app.load_workspace();
 
         if let Some(secrets) = crate::secrets::load() {
             app.base_url = secrets.base_url;
@@ -272,14 +299,16 @@ impl MuninnApp {
             return;
         }
 
-        self.model = self
-            .models
-            .iter()
-            .find(|m| m.id == "openrouter/free")
-            .or_else(|| self.models.iter().find(|m| m.free))
-            .or_else(|| self.models.first())
-            .map(|m| m.id.clone())
-            .unwrap_or_else(|| "openrouter/free".into());
+        if !self.models.iter().any(|m| m.id == self.model) {
+            self.model = self
+                .models
+                .iter()
+                .find(|m| m.id == "openrouter/free")
+                .or_else(|| self.models.iter().find(|m| m.free))
+                .or_else(|| self.models.first())
+                .map(|m| m.id.clone())
+                .unwrap_or_else(|| "openrouter/free".into());
+        }
 
         self.screen = Screen::Chat;
         let _ = crate::secrets::save(&self.base_url, &self.api_key);
@@ -372,6 +401,7 @@ impl MuninnApp {
 
         self.draft.clear();
         self.composer_ime.clear();
+        self.save_current();
         crate::platform::set_ime_text("", 0, 0);
         hide_keyboard(ctx);
         self.streaming = true;
@@ -431,6 +461,7 @@ impl MuninnApp {
                 msg.text = "[остановлено]".into();
             }
         }
+        self.save_current();
     }
 
     fn fail_last(&mut self, error: String) {
@@ -445,6 +476,7 @@ impl MuninnApp {
                 msg.text.push_str(&format!("\n\n{error}"));
             }
         }
+        self.save_current();
     }
 
     fn drain_events(&mut self, ctx: &egui::Context) {
@@ -489,6 +521,7 @@ impl MuninnApp {
                             msg.text = "[пустой ответ]".into();
                         }
                     }
+                    self.save_current();
                 }
                 UiEvent::StreamError(error) => {
                     self.fail_last(error);
@@ -519,16 +552,18 @@ impl MuninnApp {
 
     fn new_chat(&mut self, ctx: &egui::Context) {
         self.stop();
-        self.messages.clear();
-        self.title = "Новый чат".into();
-        self.chat_cost = 0.0;
-        self.chat_tokens = 0;
+        self.save_current();
+        self.chats.push(self.empty_snapshot());
+        self.active = self.chats.len() - 1;
+        self.load_active();
         self.sheet = Sheet::None;
         hide_keyboard(ctx);
+        self.persist();
     }
 
     fn change_key(&mut self, ctx: &egui::Context) {
         self.stop();
+        self.save_current();
         crate::secrets::clear();
         self.screen = Screen::Connect;
         self.api_key.clear();
@@ -542,6 +577,118 @@ impl MuninnApp {
         self.sheet = Sheet::None;
         self.error = None;
         hide_keyboard(ctx);
+    }
+
+    // ------------------------------------------------------------------
+    // Persistence
+    // ------------------------------------------------------------------
+
+    fn load_workspace(&mut self) {
+        if let Some(bytes) = crate::secrets::load_blob("chats.bin")
+            && let Ok(workspace) = serde_json::from_slice::<Workspace>(&bytes)
+        {
+            self.chats = workspace.chats;
+            self.active = workspace.active;
+        }
+
+        if self.chats.is_empty() {
+            self.chats.push(self.empty_snapshot());
+            self.active = 0;
+        }
+
+        self.active = self.active.min(self.chats.len().saturating_sub(1));
+        self.load_active();
+    }
+
+    fn empty_snapshot(&self) -> ChatSnapshot {
+        ChatSnapshot {
+            id: next_id(),
+            title: "Новый чат".to_owned(),
+            model: if self.model.is_empty() {
+                "openrouter/free".to_owned()
+            } else {
+                self.model.clone()
+            },
+            cost: 0.0,
+            tokens: 0,
+            updated_at: now_secs(),
+            messages: Vec::new(),
+        }
+    }
+
+    fn load_active(&mut self) {
+        let Some(chat) = self.chats.get(self.active) else {
+            return;
+        };
+
+        self.title = chat.title.clone();
+        self.model = if chat.model.is_empty() {
+            "openrouter/free".to_owned()
+        } else {
+            chat.model.clone()
+        };
+        self.chat_cost = chat.cost;
+        self.chat_tokens = chat.tokens;
+        self.messages = chat.messages.clone();
+
+        for message in &mut self.messages {
+            message.streaming = false;
+        }
+        // A stream interrupted before the first token leaves an empty bubble.
+        self.messages.retain(|message| {
+            !(message.role == Role::Assistant
+                && message.text.is_empty()
+                && message.reasoning.is_none()
+                && !message.error)
+        });
+    }
+
+    fn save_current(&mut self) {
+        if self.chats.is_empty() {
+            self.chats.push(self.empty_snapshot());
+            self.active = 0;
+        }
+
+        let id = self
+            .chats
+            .get(self.active)
+            .map(|chat| chat.id)
+            .unwrap_or_else(next_id);
+
+        let snapshot = ChatSnapshot {
+            id,
+            title: self.title.clone(),
+            model: self.model.clone(),
+            cost: self.chat_cost,
+            tokens: self.chat_tokens,
+            updated_at: now_secs(),
+            messages: self.messages.clone(),
+        };
+        self.chats[self.active] = snapshot;
+        self.persist();
+    }
+
+    fn persist(&self) {
+        let workspace = Workspace {
+            chats: self.chats.clone(),
+            active: self.active,
+        };
+        if let Ok(bytes) = serde_json::to_vec(&workspace) {
+            let _ = crate::secrets::save_blob("chats.bin", &bytes);
+        }
+    }
+
+    fn switch_chat(&mut self, ctx: &egui::Context, index: usize) {
+        if index >= self.chats.len() || index == self.active {
+            return;
+        }
+        self.stop();
+        self.save_current();
+        self.active = index;
+        self.load_active();
+        self.sheet = Sheet::None;
+        hide_keyboard(ctx);
+        self.persist();
     }
 
     // ------------------------------------------------------------------
@@ -978,7 +1125,8 @@ impl MuninnApp {
         let max_h = (bottom - screen.top() - 16.0).max(220.0);
         let wanted = match self.sheet {
             Sheet::Models => screen.height() * 0.72,
-            Sheet::Menu => 300.0,
+            Sheet::Chats => screen.height() * 0.68,
+            Sheet::Menu => 340.0,
             Sheet::None => 0.0,
         };
         let height = wanted.min(620.0).min(max_h);
@@ -1035,6 +1183,7 @@ impl MuninnApp {
 
                         match self.sheet {
                             Sheet::Models => self.models_sheet(ui, &mut close),
+                            Sheet::Chats => self.chats_sheet(ui, &mut close),
                             Sheet::Menu => self.menu_sheet(ui, &mut close),
                             Sheet::None => {}
                         }
@@ -1147,6 +1296,70 @@ impl MuninnApp {
             .collect()
     }
 
+    fn chats_sheet(&mut self, ui: &mut Ui, close: &mut bool) {
+        let ctx = ui.ctx().clone();
+
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Чаты").size(18.0).strong());
+            ui.label(
+                RichText::new(format!("{}", self.chats.len()))
+                    .size(10.0)
+                    .color(theme::MUTED),
+            );
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if close_button(ui).clicked() {
+                    *close = true;
+                }
+            });
+        });
+
+        ui.add_space(8.0);
+
+        if menu_row(ui, "+ Новый чат", "Начать новый разговор").clicked()
+        {
+            self.new_chat(&ctx);
+            *close = true;
+            return;
+        }
+
+        ui.add_space(6.0);
+        ui.label(RichText::new("ИСТОРИЯ").size(9.0).color(theme::MUTED));
+        ui.add_space(4.0);
+
+        let mut chosen: Option<usize> = None;
+        let list_height = (ui.available_height() - 6.0).max(120.0);
+
+        ui.scope(|ui| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .max_height(list_height)
+                .show(ui, |ui| {
+                    for index in (0..self.chats.len()).rev() {
+                        let chat = &self.chats[index];
+                        let active = index == self.active;
+                        let title = if active { &self.title } else { &chat.title };
+                        let messages = if active {
+                            self.messages.len()
+                        } else {
+                            chat.messages.len()
+                        };
+                        let subtitle =
+                            format!("{} · {}", format_cost(chat.cost), messages_label(messages));
+
+                        if chat_row(ui, title, &subtitle, active, ui.available_width()).clicked() {
+                            chosen = Some(index);
+                        }
+                    }
+                });
+        });
+
+        if let Some(index) = chosen {
+            self.switch_chat(&ctx, index);
+            *close = true;
+        }
+    }
+
     fn menu_sheet(&mut self, ui: &mut Ui, close: &mut bool) {
         let ctx = ui.ctx().clone();
 
@@ -1161,8 +1374,12 @@ impl MuninnApp {
 
         ui.add_space(10.0);
 
-        if menu_row(ui, "Новый чат", "Очистить текущий разговор").clicked()
-        {
+        if menu_row(ui, "Чаты", &format!("{} сохранено", self.chats.len())).clicked() {
+            self.sheet = Sheet::Chats;
+            self.model_search_focus = false;
+            hide_keyboard(&ctx);
+        }
+        if menu_row(ui, "Новый чат", "Начать новый разговор").clicked() {
             self.new_chat(&ctx);
             *close = true;
         }
@@ -1175,6 +1392,7 @@ impl MuninnApp {
         {
             // Reserved.
         }
+        ui.add_space(8.0);
     }
 }
 
@@ -1653,6 +1871,43 @@ fn model_row(ui: &mut Ui, model: &ModelEntry, selected: bool, width: f32) -> egu
     resp
 }
 
+fn chat_row(
+    ui: &mut Ui,
+    title: &str,
+    subtitle: &str,
+    selected: bool,
+    width: f32,
+) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 56.0), Sense::click());
+    let fill = if selected {
+        theme::ACCENT_SOFT
+    } else if resp.hovered() {
+        theme::CARD_HOVER
+    } else {
+        Color32::TRANSPARENT
+    };
+    if fill != Color32::TRANSPARENT {
+        ui.painter().rect_filled(rect.shrink(2.0), 12, fill);
+    }
+
+    let p = ui.painter().with_clip_rect(rect);
+    p.text(
+        egui::Pos2::new(rect.left() + 12.0, rect.top() + 9.0),
+        Align2::LEFT_TOP,
+        truncate(title, 34),
+        FontId::proportional(13.5),
+        theme::TEXT,
+    );
+    p.text(
+        egui::Pos2::new(rect.left() + 12.0, rect.top() + 30.0),
+        Align2::LEFT_TOP,
+        subtitle,
+        FontId::proportional(9.5),
+        theme::MUTED,
+    );
+    resp
+}
+
 fn menu_row(ui: &mut Ui, title: &str, subtitle: &str) -> egui::Response {
     let width = ui.available_width();
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 58.0), Sense::click());
@@ -1851,4 +2106,33 @@ fn friendly_error(raw: &str) -> String {
     } else {
         raw.to_owned()
     }
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+fn next_id() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
+fn messages_label(count: usize) -> String {
+    let last_two = count % 100;
+    let last = count % 10;
+    let word = if (11..=14).contains(&last_two) {
+        "сообщений"
+    } else {
+        match last {
+            1 => "сообщение",
+            2..=4 => "сообщения",
+            _ => "сообщений",
+        }
+    };
+    format!("{count} {word}")
 }
