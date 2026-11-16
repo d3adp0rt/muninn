@@ -52,7 +52,6 @@ mod android {
     use std::sync::OnceLock;
     use std::sync::atomic::{AtomicI32, Ordering::Relaxed};
 
-    use android_activity::input::{TextInputState, TextSpan};
     use jni::objects::GlobalRef;
 
     static ACTIVITY: OnceLock<GlobalRef> = OnceLock::new();
@@ -121,56 +120,6 @@ mod android {
         RIGHT.store(right, Relaxed);
         super::wake_ui();
     }
-
-    /// Configure the soft keyboard for the field that just gained focus.
-    pub fn configure_ime(multiline: bool, password: bool) {
-        use android_activity::input::{ImeOptions, InputType, TextInputAction};
-
-        let Some(app) = crate::ANDROID_APP.get() else {
-            return;
-        };
-
-        let mut input_type = InputType::TYPE_CLASS_TEXT
-            | InputType::TYPE_TEXT_FLAG_NO_SUGGESTIONS
-            | InputType::TYPE_TEXT_FLAG_CAP_SENTENCES;
-        if multiline {
-            input_type |= InputType::TYPE_TEXT_FLAG_MULTI_LINE;
-        }
-        if password {
-            input_type |= InputType::TYPE_TEXT_VARIATION_PASSWORD;
-        }
-
-        let options =
-            ImeOptions::IME_FLAG_NO_FULLSCREEN | ImeOptions::IME_FLAG_NO_PERSONALIZED_LEARNING;
-
-        app.set_ime_editor_info(input_type, TextInputAction::None, options);
-    }
-
-    /// Current text and selection (byte offsets) as seen by the Android IME.
-    pub fn ime_state() -> Option<(String, (usize, usize))> {
-        let app = crate::ANDROID_APP.get()?;
-        let state = app.text_input_state();
-        let len = state.text.len();
-        Some((
-            state.text,
-            (state.selection.start.min(len), state.selection.end.min(len)),
-        ))
-    }
-
-    /// Push text and selection (byte offsets) from the Rust UI into the IME.
-    pub fn set_ime_text(text: &str, start: usize, end: usize) {
-        let Some(app) = crate::ANDROID_APP.get() else {
-            return;
-        };
-        let start = start.min(text.len());
-        let end = end.min(text.len());
-        let state = TextInputState {
-            text: text.to_owned(),
-            selection: TextSpan { start, end },
-            ..Default::default()
-        };
-        app.set_text_input_state(state);
-    }
 }
 
 #[cfg(target_os = "android")]
@@ -187,28 +136,7 @@ pub fn with_activity<R>(
 }
 
 #[cfg(target_os = "android")]
-pub use android::{
-    configure_ime, ime_state, init_activity, set_back_handled, set_ime_text, take_back_requested,
-};
-
-#[cfg(not(target_os = "android"))]
-pub fn ime_state() -> Option<(String, (usize, usize))> {
-    None
-}
-
-#[cfg(not(target_os = "android"))]
-pub fn configure_ime(_multiline: bool, _password: bool) {}
-
-#[cfg(not(target_os = "android"))]
-pub fn take_back_requested() -> bool {
-    false
-}
-
-#[cfg(not(target_os = "android"))]
-pub fn set_back_handled(_value: bool) {}
-
-#[cfg(not(target_os = "android"))]
-pub fn set_ime_text(_text: &str, _start: usize, _end: usize) {}
+pub use android::{init_activity, set_back_handled, take_back_requested};
 
 #[cfg(target_os = "android")]
 pub fn clipboard_get() -> Option<String> {
@@ -281,6 +209,14 @@ pub fn set_light_system_bars(light: bool) {
 
 #[cfg(not(target_os = "android"))]
 pub fn set_light_system_bars(_light: bool) {}
+
+#[cfg(not(target_os = "android"))]
+pub fn take_back_requested() -> bool {
+    false
+}
+
+#[cfg(not(target_os = "android"))]
+pub fn set_back_handled(_value: bool) {}
 
 #[cfg(not(target_os = "android"))]
 pub fn clipboard_get() -> Option<String> {

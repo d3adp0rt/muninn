@@ -1677,7 +1677,6 @@ dependencies = [
 name = "muninn"
 version = "0.1.0"
 dependencies = [
- "android-activity",
  "android_logger",
  "bytes",
  "eframe",

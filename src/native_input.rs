@@ -13,6 +13,10 @@ use egui::Color32;
 use egui::Rect;
 
 pub const TARGET_COMPOSER: i32 = 0;
+pub const TARGET_MODEL_SEARCH: i32 = 1;
+pub const TARGET_CHAT_SEARCH: i32 = 2;
+pub const TARGET_BASE_URL: i32 = 3;
+pub const TARGET_API_KEY: i32 = 4;
 
 #[derive(Debug)]
 #[allow(dead_code)]

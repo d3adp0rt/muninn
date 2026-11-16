@@ -3,8 +3,8 @@
 //! Design notes:
 //! - one screen at a time; secondary surfaces are bottom sheets, never floating
 //!   windows (they end up under the status bar on tall phones);
-//! - every text field goes through [`ime_sync`], because winit's Android backend
-//!   does not forward IME commits;
+//! - text fields are backed by a native Android `EditText`; winit's Android
+//!   backend does not forward IME commits;
 //! - the composer owns the bottom safe area and grows above the keyboard.
 
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -29,14 +29,6 @@ pub struct MuninnApp {
 
     base_url: String,
     api_key: String,
-    base_focus: bool,
-    key_focus: bool,
-    base_ime: String,
-    key_ime: String,
-    search_ime: String,
-    base_sel: (usize, usize),
-    key_sel: (usize, usize),
-    search_sel: (usize, usize),
     connecting: bool,
     error: Option<String>,
 
@@ -44,7 +36,6 @@ pub struct MuninnApp {
     model: String,
     sheet: Sheet,
     model_query: String,
-    model_search_focus: bool,
     model_filter: ModelFilter,
 
     chats: Vec<ChatSnapshot>,
@@ -52,15 +43,12 @@ pub struct MuninnApp {
     theme_mode: theme::Mode,
     drawer_open: bool,
     chat_query: String,
-    chat_search_focus: bool,
-    chat_search_ime: String,
-    chat_search_sel: (usize, usize),
 
     title: String,
     messages: Vec<Message>,
     draft: String,
-    native_active: bool,
-    composer_rect: Rect,
+    active_input: Option<i32>,
+    active_rect: Rect,
     repaint_ticks: u8,
     deep_think: bool,
     web: bool,
@@ -179,35 +167,23 @@ impl MuninnApp {
             screen: Screen::Connect,
             base_url: OPENROUTER_BASE.to_owned(),
             api_key: String::new(),
-            base_focus: false,
-            key_focus: false,
-            base_ime: String::new(),
-            key_ime: String::new(),
-            search_ime: String::new(),
-            base_sel: (0, 0),
-            key_sel: (0, 0),
-            search_sel: (0, 0),
             connecting: false,
             error: None,
             models: Vec::new(),
             model: "openrouter/free".to_owned(),
             sheet: Sheet::None,
             model_query: String::new(),
-            model_search_focus: false,
             model_filter: ModelFilter::All,
             chats: Vec::new(),
             active: 0,
             theme_mode: theme::Mode::Dark,
             drawer_open: false,
             chat_query: String::new(),
-            chat_search_focus: false,
-            chat_search_ime: String::new(),
-            chat_search_sel: (0, 0),
             title: "Новый чат".to_owned(),
             messages: Vec::new(),
             draft: String::new(),
-            native_active: false,
-            composer_rect: Rect::NOTHING,
+            active_input: None,
+            active_rect: Rect::NOTHING,
             repaint_ticks: 0,
             deep_think: false,
             web: false,
@@ -240,6 +216,7 @@ impl MuninnApp {
             return;
         }
 
+        self.drain_native();
         let base = self.base_url.trim().trim_end_matches('/').to_owned();
         let key = self.api_key.trim().to_owned();
 
@@ -556,14 +533,13 @@ impl MuninnApp {
     fn open_sheet(&mut self, ctx: &egui::Context, sheet: Sheet) {
         self.stop_native();
         self.sheet = sheet;
-        self.model_search_focus = false;
         self.drawer_open = false;
         hide_keyboard(ctx);
     }
 
     fn close_sheet(&mut self, ctx: &egui::Context) {
+        self.stop_native();
         self.sheet = Sheet::None;
-        self.model_search_focus = false;
         hide_keyboard(ctx);
     }
 
@@ -727,7 +703,6 @@ impl MuninnApp {
             if menu_button(ui).clicked() {
                 self.stop_native();
                 self.drawer_open = true;
-                self.chat_search_focus = false;
                 hide_keyboard(&ctx);
             }
 
@@ -962,28 +937,10 @@ impl MuninnApp {
         }
     }
 
-    fn start_native(&mut self, ctx: &egui::Context) {
-        if self.composer_rect == Rect::NOTHING {
-            return;
-        }
-        if crate::native_input::show(
-            crate::native_input::TARGET_COMPOSER,
-            self.composer_rect,
-            &self.draft,
-            "Сообщение…",
-            true,
-            false,
-            ctx.pixels_per_point(),
-        ) {
-            self.native_active = true;
-            self.repaint_ticks = 30;
-        }
-    }
-
     fn stop_native(&mut self) {
-        if self.native_active {
+        if self.active_input.is_some() {
             crate::native_input::hide();
-            self.native_active = false;
+            self.active_input = None;
         }
         self.repaint_ticks = 30;
     }
@@ -991,17 +948,19 @@ impl MuninnApp {
     fn drain_native(&mut self) {
         for event in crate::native_input::poll() {
             match event {
-                crate::native_input::Event::Text {
-                    target: crate::native_input::TARGET_COMPOSER,
-                    text,
-                } => {
-                    self.draft = text;
-                }
+                crate::native_input::Event::Text { target, text } => match target {
+                    crate::native_input::TARGET_COMPOSER => self.draft = text,
+                    crate::native_input::TARGET_MODEL_SEARCH => self.model_query = text,
+                    crate::native_input::TARGET_CHAT_SEARCH => self.chat_query = text,
+                    crate::native_input::TARGET_BASE_URL => self.base_url = text,
+                    crate::native_input::TARGET_API_KEY => self.api_key = text,
+                    _ => {}
+                },
                 crate::native_input::Event::Focus {
-                    target: crate::native_input::TARGET_COMPOSER,
+                    target,
                     focused: false,
-                } => {
-                    self.native_active = false;
+                } if self.active_input == Some(target) => {
+                    self.active_input = None;
                     crate::native_input::hide();
                     self.repaint_ticks = 30;
                 }
@@ -1012,7 +971,7 @@ impl MuninnApp {
 
     fn composer(&mut self, ui: &mut Ui, ctx: &egui::Context) {
         let mut submit = false;
-        let focused = self.native_active;
+        let focused = self.active_input == Some(crate::native_input::TARGET_COMPOSER);
 
         egui::Frame::new()
             .fill(theme::c().surface_raised)
@@ -1027,39 +986,20 @@ impl MuninnApp {
             ))
             .inner_margin(Margin::symmetric(10, 8))
             .show(ui, |ui| {
-                let (rect, resp) =
-                    ui.allocate_exact_size(Vec2::new(ui.available_width(), 44.0), Sense::click());
-                self.composer_rect = rect;
-
-                if self.native_active {
-                    // The native EditText is above the SurfaceView and owns
-                    // text, caret and selection. Keep it glued to the layout.
-                    crate::native_input::set_rect(rect, ctx.pixels_per_point());
-                } else {
-                    let painter = ui.painter().with_clip_rect(rect);
-                    let origin = Pos2::new(rect.left() + 4.0, rect.top() + 10.0);
-                    if self.draft.is_empty() {
-                        painter.text(
-                            origin,
-                            Align2::LEFT_TOP,
-                            "Сообщение…",
-                            FontId::proportional(15.0),
-                            theme::c().text_tertiary,
-                        );
-                    } else {
-                        let galley = painter.layout(
-                            self.draft.clone(),
-                            FontId::proportional(15.0),
-                            theme::c().text,
-                            rect.width() - 8.0,
-                        );
-                        painter.galley(origin, galley, theme::c().text);
-                    }
-                }
-
-                if resp.clicked() && !self.native_active {
-                    self.start_native(ctx);
-                }
+                native_field(
+                    ui,
+                    ctx,
+                    crate::native_input::TARGET_COMPOSER,
+                    &mut self.draft,
+                    "Сообщение…",
+                    true,
+                    false,
+                    44.0,
+                    false,
+                    &mut self.active_input,
+                    &mut self.active_rect,
+                    &mut self.repaint_ticks,
+                );
 
                 ui.add_space(2.0);
 
@@ -1144,39 +1084,36 @@ impl MuninnApp {
                                 .inner_margin(Margin::same(16))
                                 .show(ui, |ui| {
                                     field_label(ui, "BASE URL");
-                                    let base = egui::TextEdit::singleline(&mut self.base_url)
-                                        .desired_width(f32::INFINITY)
-                                        .hint_text(OPENROUTER_BASE)
-                                        .margin(Margin::symmetric(12, 12));
-                                    let base_resp = ui.add(base);
-                                    ime_sync(
+                                    native_field(
                                         ui,
-                                        &base_resp,
+                                        ctx,
+                                        crate::native_input::TARGET_BASE_URL,
                                         &mut self.base_url,
-                                        &mut self.base_focus,
-                                        &mut self.base_ime,
-                                        &mut self.base_sel,
+                                        OPENROUTER_BASE,
                                         false,
                                         false,
+                                        44.0,
+                                        true,
+                                        &mut self.active_input,
+                                        &mut self.active_rect,
+                                        &mut self.repaint_ticks,
                                     );
 
                                     ui.add_space(12.0);
                                     field_label(ui, "API KEY");
-                                    let key = egui::TextEdit::singleline(&mut self.api_key)
-                                        .desired_width(f32::INFINITY)
-                                        .hint_text("sk-or-v1-…")
-                                        .password(true)
-                                        .margin(Margin::symmetric(12, 12));
-                                    let key_resp = ui.add(key);
-                                    ime_sync(
+                                    native_field(
                                         ui,
-                                        &key_resp,
+                                        ctx,
+                                        crate::native_input::TARGET_API_KEY,
                                         &mut self.api_key,
-                                        &mut self.key_focus,
-                                        &mut self.key_ime,
-                                        &mut self.key_sel,
+                                        "sk-or-v1-…",
                                         false,
                                         true,
+                                        44.0,
+                                        true,
+                                        &mut self.active_input,
+                                        &mut self.active_rect,
+                                        &mut self.repaint_ticks,
                                     );
 
                                     ui.add_space(8.0);
@@ -1194,12 +1131,10 @@ impl MuninnApp {
                                             && let Some(text) = crate::platform::clipboard_get()
                                         {
                                             self.api_key = text.trim().to_owned();
-                                            if self.key_focus {
-                                                crate::platform::set_ime_text(
-                                                    &self.api_key,
-                                                    self.api_key.len(),
-                                                    self.api_key.len(),
-                                                );
+                                            if self.active_input
+                                                == Some(crate::native_input::TARGET_API_KEY)
+                                            {
+                                                crate::native_input::set_text(&self.api_key);
                                             }
                                         }
 
@@ -1215,12 +1150,10 @@ impl MuninnApp {
                                             .clicked()
                                         {
                                             self.base_url = OPENROUTER_BASE.to_owned();
-                                            if self.base_focus {
-                                                crate::platform::set_ime_text(
-                                                    &self.base_url,
-                                                    self.base_url.len(),
-                                                    self.base_url.len(),
-                                                );
+                                            if self.active_input
+                                                == Some(crate::native_input::TARGET_BASE_URL)
+                                            {
+                                                crate::native_input::set_text(&self.base_url);
                                             }
                                         }
                                     });
@@ -1421,20 +1354,20 @@ impl MuninnApp {
 
         ui.add_space(8.0);
 
-        let search = egui::TextEdit::singleline(&mut self.model_query)
-            .hint_text("Поиск по названию или id…")
-            .desired_width(f32::INFINITY)
-            .margin(Margin::symmetric(12, 9));
-        let resp = ui.add(search);
-        ime_sync(
+        let ctx = ui.ctx().clone();
+        native_field(
             ui,
-            &resp,
+            &ctx,
+            crate::native_input::TARGET_MODEL_SEARCH,
             &mut self.model_query,
-            &mut self.model_search_focus,
-            &mut self.search_ime,
-            &mut self.search_sel,
+            "Поиск по названию или id…",
             false,
             false,
+            44.0,
+            true,
+            &mut self.active_input,
+            &mut self.active_rect,
+            &mut self.repaint_ticks,
         );
 
         ui.add_space(8.0);
@@ -1594,20 +1527,19 @@ impl MuninnApp {
 
                         ui.add_space(8.0);
 
-                        let search = egui::TextEdit::singleline(&mut self.chat_query)
-                            .hint_text("Поиск по чатам")
-                            .desired_width(f32::INFINITY)
-                            .margin(Margin::symmetric(12, 10));
-                        let resp = ui.add(search);
-                        ime_sync(
+                        native_field(
                             ui,
-                            &resp,
+                            ctx,
+                            crate::native_input::TARGET_CHAT_SEARCH,
                             &mut self.chat_query,
-                            &mut self.chat_search_focus,
-                            &mut self.chat_search_ime,
-                            &mut self.chat_search_sel,
+                            "Поиск по чатам",
                             false,
                             false,
+                            44.0,
+                            true,
+                            &mut self.active_input,
+                            &mut self.active_rect,
+                            &mut self.repaint_ticks,
                         );
 
                         ui.add_space(8.0);
@@ -1711,6 +1643,7 @@ impl MuninnApp {
             });
 
         if dismiss || close {
+            self.stop_native();
             self.drawer_open = false;
             hide_keyboard(ctx);
         }
@@ -1789,12 +1722,12 @@ impl eframe::App for MuninnApp {
         self.drain_events(ui.ctx());
         self.drain_native();
 
-        if self.native_active {
+        if self.active_input.is_some() {
             let clicked_outside = ui.ctx().input(|i| {
                 i.pointer.any_click()
                     && i.pointer
                         .interact_pos()
-                        .is_some_and(|pos| !self.composer_rect.contains(pos))
+                        .is_some_and(|pos| !self.active_rect.contains(pos))
             });
             if clicked_outside {
                 self.stop_native();
@@ -1802,7 +1735,7 @@ impl eframe::App for MuninnApp {
         }
 
         if crate::platform::take_back_requested() {
-            if self.native_active {
+            if self.active_input.is_some() {
                 self.stop_native();
             } else if self.drawer_open {
                 self.drawer_open = false;
@@ -1812,12 +1745,8 @@ impl eframe::App for MuninnApp {
             }
         }
         crate::platform::set_back_handled(
-            self.native_active || self.drawer_open || self.sheet != Sheet::None,
+            self.active_input.is_some() || self.drawer_open || self.sheet != Sheet::None,
         );
-
-        if self.screen == Screen::Connect {
-            self.stop_native();
-        }
 
         let screen = ui.max_rect();
         let insets = crate::platform::system_insets(ui);
@@ -1900,8 +1829,11 @@ impl eframe::App for MuninnApp {
         self.drawer(&ctx, screen, insets);
         self.sheets(&ctx, screen, insets);
 
-        if self.native_active {
+        if self.active_input.is_some() {
             ui.ctx().request_repaint_after(Duration::from_millis(50));
+        } else if self.repaint_ticks > 0 {
+            self.repaint_ticks -= 1;
+            ui.ctx().request_repaint_after(Duration::from_millis(33));
         }
     }
 
@@ -2397,6 +2329,96 @@ fn link_button(ui: &mut Ui, label: &str) -> egui::Response {
 // Helpers
 // ----------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::ptr_arg)]
+fn native_field(
+    ui: &mut Ui,
+    ctx: &egui::Context,
+    target: i32,
+    text: &mut String,
+    hint: &str,
+    multiline: bool,
+    password: bool,
+    height: f32,
+    styled: bool,
+    active: &mut Option<i32>,
+    active_rect: &mut Rect,
+    repaint_ticks: &mut u8,
+) -> egui::Response {
+    let (rect, resp) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::click());
+    let is_active = *active == Some(target);
+    *active_rect = rect;
+    let content_rect = if styled {
+        rect.shrink2(Vec2::new(10.0, 0.0))
+    } else {
+        rect
+    };
+
+    if styled {
+        ui.painter().rect(
+            rect,
+            14,
+            theme::c().surface_raised,
+            Stroke::new(1.0, theme::c().border),
+            egui::StrokeKind::Inside,
+        );
+    }
+
+    if is_active {
+        crate::native_input::set_rect(content_rect, ctx.pixels_per_point());
+    } else {
+        let painter = ui.painter().with_clip_rect(content_rect);
+        let top = if multiline {
+            content_rect.top() + 10.0
+        } else {
+            content_rect.center().y - 9.0
+        };
+        let origin = Pos2::new(content_rect.left() + 2.0, top);
+        let display = if password {
+            "•".repeat(text.chars().count())
+        } else {
+            text.clone()
+        };
+
+        if display.is_empty() {
+            painter.text(
+                origin,
+                Align2::LEFT_TOP,
+                hint,
+                FontId::proportional(15.0),
+                theme::c().text_tertiary,
+            );
+        } else {
+            let galley = painter.layout(
+                display,
+                FontId::proportional(15.0),
+                theme::c().text,
+                content_rect.width() - 4.0,
+            );
+            painter.galley(origin, galley, theme::c().text);
+        }
+    }
+
+    if resp.clicked()
+        && !is_active
+        && crate::native_input::show(
+            target,
+            rect,
+            text,
+            hint,
+            multiline,
+            password,
+            ctx.pixels_per_point(),
+        )
+    {
+        *active = Some(target);
+        *repaint_ticks = 30;
+    }
+
+    resp
+}
+
 fn field_label(ui: &mut Ui, text: &str) {
     ui.label(
         RichText::new(text)
@@ -2413,96 +2435,6 @@ fn field_label(ui: &mut Ui, text: &str) {
 /// for taps, arrows and hardware keys. Each side wins only when it actually
 /// changed since the last frame, so neither can revert the other.
 #[allow(clippy::too_many_arguments)]
-fn ime_sync(
-    ui: &Ui,
-    resp: &egui::Response,
-    text: &mut String,
-    focused: &mut bool,
-    last_ime: &mut String,
-    last_sel: &mut (usize, usize),
-    multiline: bool,
-    password: bool,
-) {
-    if !resp.has_focus() {
-        *focused = false;
-        return;
-    }
-
-    ui.ctx().request_repaint_after(Duration::from_millis(50));
-
-    if !*focused {
-        crate::platform::configure_ime(multiline, password);
-        let end = text.len();
-        crate::platform::set_ime_text(text, end, end);
-        *last_ime = text.clone();
-        *last_sel = (end, end);
-        *focused = true;
-        return;
-    }
-
-    let egui_sel = egui_selection(ui.ctx(), resp.id, text);
-    let Some((ime_text, ime_sel)) = crate::platform::ime_state() else {
-        return;
-    };
-
-    if ime_text != *last_ime {
-        // Soft-keyboard edit or paste.
-        *last_ime = ime_text.clone();
-        if ime_text != *text {
-            *text = ime_text;
-        }
-        set_egui_selection(ui.ctx(), resp.id, text, ime_sel);
-        *last_sel = ime_sel;
-        ui.ctx().request_repaint();
-        return;
-    }
-
-    if let Some(sel) = egui_sel
-        && sel != *last_sel
-    {
-        // Tap, arrow key or hardware edit. Push both text and selection.
-        crate::platform::set_ime_text(text, sel.0, sel.1);
-        *last_ime = text.clone();
-        *last_sel = sel;
-    }
-}
-
-fn egui_selection(ctx: &egui::Context, id: Id, text: &str) -> Option<(usize, usize)> {
-    let state = egui::widgets::text_edit::TextEditState::load(ctx, id)?;
-    let range = state.cursor.char_range()?;
-    let a = char_to_byte(text, range.primary.index.0);
-    let b = char_to_byte(text, range.secondary.index.0);
-    Some((a.min(b), a.max(b)))
-}
-
-fn set_egui_selection(ctx: &egui::Context, id: Id, text: &str, selection: (usize, usize)) {
-    let start = byte_to_char(text, selection.0);
-    let end = byte_to_char(text, selection.1);
-    let mut state = egui::widgets::text_edit::TextEditState::load(ctx, id).unwrap_or_default();
-    state
-        .cursor
-        .set_char_range(Some(egui::text::CCursorRange::two(
-            egui::text::CCursor::new(start),
-            egui::text::CCursor::new(end),
-        )));
-    state.store(ctx, id);
-}
-
-fn char_to_byte(text: &str, char_index: usize) -> usize {
-    text.char_indices()
-        .nth(char_index)
-        .map(|(byte, _)| byte)
-        .unwrap_or(text.len())
-}
-
-fn byte_to_char(text: &str, mut byte: usize) -> usize {
-    byte = byte.min(text.len());
-    while byte > 0 && !text.is_char_boundary(byte) {
-        byte -= 1;
-    }
-    text[..byte].chars().count()
-}
-
 fn hide_keyboard(ctx: &egui::Context) {
     if let Some(id) = ctx.memory(|m| m.focused()) {
         ctx.memory_mut(|m| m.surrender_focus(id));
