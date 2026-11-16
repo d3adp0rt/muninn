@@ -82,6 +82,16 @@ public class MainActivity extends GameActivity {
         return super.onApplyWindowInsets(view, insets);
     }
 
+    /** Switch system bar icon color for light/dark app themes. */
+    public void muninnSetLightBars(boolean light) {
+        runOnUiThread(() -> {
+            WindowInsetsControllerCompat controller =
+                    WindowCompat.getInsetsController(getWindow(), getWindow().getDecorView());
+            controller.setAppearanceLightStatusBars(light);
+            controller.setAppearanceLightNavigationBars(light);
+        });
+    }
+
     /** Read the primary clipboard item as text (null if empty). */
     public String muninnClipboardGet() {
         ClipboardManager manager = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);

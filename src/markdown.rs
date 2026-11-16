@@ -27,7 +27,7 @@ pub fn render(ui: &mut Ui, text: &str, width: f32, streaming: bool) {
         ui.add_space(3.0);
         let (rect, _) = ui.allocate_exact_size(Vec2::new(2.0, 13.0), Sense::hover());
         ui.painter()
-            .rect_filled(rect, 1, theme::ACCENT.gamma_multiply(alpha));
+            .rect_filled(rect, 1, theme::c().accent.gamma_multiply(alpha));
     }
 }
 
@@ -267,7 +267,7 @@ impl<'u> Renderer<'u> {
 
         if self.quote > 0 {
             let format = TextFormat {
-                color: theme::MUTED,
+                color: theme::c().text_secondary,
                 ..self.format()
             };
             self.spans.push(("│ ".repeat(self.quote), format));
@@ -299,25 +299,25 @@ impl<'u> Renderer<'u> {
                 },
             ),
             color: if self.style.link {
-                theme::ACCENT
+                theme::c().accent
             } else if self.quote > 0 {
-                theme::MUTED
+                theme::c().text_secondary
             } else {
-                theme::TEXT
+                theme::c().text
             },
             background: if self.style.code {
-                theme::CARD_HOVER
+                theme::c().surface_overlay
             } else {
                 Color32::TRANSPARENT
             },
             italics: self.style.italic,
             underline: if self.style.link {
-                Stroke::new(1.0, theme::ACCENT)
+                Stroke::new(1.0, theme::c().accent)
             } else {
                 Stroke::NONE
             },
             strikethrough: if self.style.strike {
-                Stroke::new(1.0, theme::MUTED)
+                Stroke::new(1.0, theme::c().text_secondary)
             } else {
                 Stroke::NONE
             },
@@ -351,16 +351,16 @@ impl<'u> Renderer<'u> {
 
         self.ui.add_space(2.0);
         egui::Frame::new()
-            .fill(theme::BG)
+            .fill(theme::c().bg)
             .corner_radius(10)
-            .stroke(Stroke::new(1.0, theme::BORDER))
+            .stroke(Stroke::new(1.0, theme::c().border))
             .inner_margin(Margin::symmetric(10, 8))
             .show(self.ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(
                         RichText::new(if lang.is_empty() { "code" } else { lang })
                             .size(9.5)
-                            .color(theme::MUTED),
+                            .color(theme::c().text_secondary),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if text_button(ui, "copy") {
@@ -397,21 +397,23 @@ fn ui_row(ui: &mut Ui, row: &[String]) {
             if i > 0 {
                 ui.add_space(14.0);
             }
-            ui.label(RichText::new(cell).size(12.0).color(theme::TEXT));
+            ui.label(RichText::new(cell).size(12.0).color(theme::c().text));
         }
     });
 }
 
 fn text_button(ui: &mut Ui, label: &str) -> bool {
-    let galley =
-        ui.painter()
-            .layout_no_wrap(label.to_owned(), FontId::proportional(9.5), theme::MUTED);
+    let galley = ui.painter().layout_no_wrap(
+        label.to_owned(),
+        FontId::proportional(9.5),
+        theme::c().text_secondary,
+    );
     let (rect, resp) =
         ui.allocate_exact_size(Vec2::new(galley.size().x + 4.0, 18.0), Sense::click());
     ui.painter().galley(
         egui::Pos2::new(rect.left() + 2.0, rect.center().y - galley.size().y * 0.5),
         galley,
-        theme::MUTED,
+        theme::c().text_secondary,
     );
     resp.clicked()
 }

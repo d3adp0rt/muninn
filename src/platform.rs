@@ -230,6 +230,31 @@ pub fn clipboard_set(text: &str) {
     );
 }
 
+#[cfg(target_os = "android")]
+pub fn set_light_system_bars(light: bool) {
+    use jni::JavaVM;
+
+    let ctx = ndk_context::android_context();
+    let Ok(vm) = (unsafe { JavaVM::from_raw(ctx.vm().cast()) }) else {
+        return;
+    };
+    let Ok(mut env) = vm.attach_current_thread() else {
+        return;
+    };
+    let Some(activity) = android::activity() else {
+        return;
+    };
+    let _ = env.call_method(
+        activity.as_obj(),
+        "muninnSetLightBars",
+        "(Z)V",
+        &[jni::objects::JValue::Bool(light as u8)],
+    );
+}
+
+#[cfg(not(target_os = "android"))]
+pub fn set_light_system_bars(_light: bool) {}
+
 #[cfg(not(target_os = "android"))]
 pub fn clipboard_get() -> Option<String> {
     None

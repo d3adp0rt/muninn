@@ -51,6 +51,12 @@ pub struct MuninnApp {
 
     chats: Vec<ChatSnapshot>,
     active: usize,
+    theme_mode: theme::Mode,
+    drawer_open: bool,
+    chat_query: String,
+    chat_search_focus: bool,
+    chat_search_ime: String,
+    chat_search_sel: (usize, usize),
 
     title: String,
     messages: Vec<Message>,
@@ -77,8 +83,7 @@ enum Screen {
 enum Sheet {
     None,
     Models,
-    Chats,
-    Menu,
+    Settings,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -149,6 +154,8 @@ struct ChatSnapshot {
 struct Workspace {
     chats: Vec<ChatSnapshot>,
     active: usize,
+    #[serde(default)]
+    theme: theme::Mode,
 }
 
 enum UiEvent {
@@ -163,7 +170,6 @@ enum UiEvent {
 
 impl MuninnApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        theme::apply(&cc.egui_ctx);
         let _ = crate::runtime::rt();
 
         let (tx, rx) = channel();
@@ -192,6 +198,12 @@ impl MuninnApp {
             model_filter: ModelFilter::All,
             chats: Vec::new(),
             active: 0,
+            theme_mode: theme::Mode::Dark,
+            drawer_open: false,
+            chat_query: String::new(),
+            chat_search_focus: false,
+            chat_search_ime: String::new(),
+            chat_search_sel: (0, 0),
             title: "Новый чат".to_owned(),
             messages: Vec::new(),
             draft: String::new(),
@@ -207,6 +219,7 @@ impl MuninnApp {
         };
 
         app.load_workspace();
+        theme::init(&cc.egui_ctx, app.theme_mode);
 
         if let Some(secrets) = crate::secrets::load() {
             app.base_url = secrets.base_url;
@@ -541,6 +554,7 @@ impl MuninnApp {
     fn open_sheet(&mut self, ctx: &egui::Context, sheet: Sheet) {
         self.sheet = sheet;
         self.model_search_focus = false;
+        self.drawer_open = false;
         hide_keyboard(ctx);
     }
 
@@ -589,6 +603,7 @@ impl MuninnApp {
         {
             self.chats = workspace.chats;
             self.active = workspace.active;
+            self.theme_mode = workspace.theme;
         }
 
         if self.chats.is_empty() {
@@ -672,6 +687,7 @@ impl MuninnApp {
         let workspace = Workspace {
             chats: self.chats.clone(),
             active: self.active,
+            theme: self.theme_mode,
         };
         if let Ok(bytes) = serde_json::to_vec(&workspace) {
             let _ = crate::secrets::save_blob("chats.bin", &bytes);
@@ -700,7 +716,9 @@ impl MuninnApp {
 
         ui.horizontal(|ui| {
             if menu_button(ui).clicked() {
-                self.open_sheet(&ctx, Sheet::Menu);
+                self.drawer_open = true;
+                self.chat_search_focus = false;
+                hide_keyboard(&ctx);
             }
 
             ui.add_space(2.0);
@@ -725,12 +743,16 @@ impl MuninnApp {
                             format_tokens(self.chat_tokens)
                         )
                     };
-                    ui.label(RichText::new(subtitle).size(10.0).color(theme::MUTED));
+                    ui.label(
+                        RichText::new(subtitle)
+                            .size(10.5)
+                            .color(theme::c().text_secondary),
+                    );
                 },
             );
 
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if model_chip(ui, &self.model_display_name(), 158.0).clicked() {
+                if model_chip(ui, &self.model_display_name(), 150.0).clicked() {
                     self.open_sheet(&ctx, Sheet::Models);
                 }
             });
@@ -746,12 +768,19 @@ impl MuninnApp {
         if is_user {
             ui.with_layout(Layout::right_to_left(Align::TOP), |ui| {
                 egui::Frame::new()
-                    .fill(theme::USER_BUBBLE)
-                    .corner_radius(18)
-                    .inner_margin(Margin::symmetric(12, 9))
+                    .fill(theme::c().user_bubble)
+                    .corner_radius(20)
+                    .inner_margin(Margin::symmetric(14, 10))
                     .show(ui, |ui| {
                         ui.set_max_width(text_w);
-                        ui.add(egui::Label::new(RichText::new(&msg.text).size(14.5)).wrap());
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(&msg.text)
+                                    .size(15.0)
+                                    .color(theme::c().on_user),
+                            )
+                            .wrap(),
+                        );
                     });
             });
             ui.add_space(14.0);
@@ -763,7 +792,11 @@ impl MuninnApp {
             ui.horizontal(|ui| {
                 avatar(ui);
                 ui.add_space(6.0);
-                ui.label(RichText::new("Muninn").size(10.5).color(theme::MUTED));
+                ui.label(
+                    RichText::new("Muninn")
+                        .size(10.5)
+                        .color(theme::c().text_secondary),
+                );
             });
             ui.add_space(5.0);
 
@@ -774,32 +807,43 @@ impl MuninnApp {
                     format!("Размышления · {} симв.", reasoning.chars().count())
                 };
 
-                egui::CollapsingHeader::new(RichText::new(label).size(10.5).color(theme::MUTED))
-                    .default_open(false)
+                egui::Frame::new()
+                    .fill(theme::c().surface_raised)
+                    .corner_radius(12)
+                    .stroke(Stroke::new(1.0, theme::c().border))
+                    .inner_margin(Margin::symmetric(10, 5))
                     .show(ui, |ui| {
-                        ui.add(
-                            egui::Label::new(
-                                RichText::new(reasoning)
-                                    .monospace()
-                                    .size(12.0)
-                                    .color(theme::MUTED),
-                            )
-                            .wrap(),
-                        );
+                        egui::CollapsingHeader::new(
+                            RichText::new(label)
+                                .size(10.5)
+                                .color(theme::c().text_secondary),
+                        )
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(reasoning)
+                                        .monospace()
+                                        .size(12.0)
+                                        .color(theme::c().text_secondary),
+                                )
+                                .wrap(),
+                            );
+                        });
                     });
-                ui.add_space(3.0);
+                ui.add_space(8.0);
             }
 
             if msg.error {
                 egui::Frame::new()
-                    .fill(theme::SURFACE)
+                    .fill(theme::c().surface)
                     .corner_radius(12)
-                    .stroke(Stroke::new(1.0, theme::DANGER))
+                    .stroke(Stroke::new(1.0, theme::c().danger))
                     .inner_margin(Margin::symmetric(12, 9))
                     .show(ui, |ui| {
                         ui.add(
                             egui::Label::new(
-                                RichText::new(&msg.text).size(13.5).color(theme::DANGER),
+                                RichText::new(&msg.text).size(13.5).color(theme::c().danger),
                             )
                             .wrap(),
                         );
@@ -809,7 +853,11 @@ impl MuninnApp {
             } else if msg.streaming {
                 ui.horizontal(|ui| {
                     typing_dot(ui);
-                    ui.label(RichText::new("печатает…").size(11.0).color(theme::MUTED));
+                    ui.label(
+                        RichText::new("печатает…")
+                            .size(11.0)
+                            .color(theme::c().text_secondary),
+                    );
                 });
             }
 
@@ -827,7 +875,7 @@ impl MuninnApp {
                                 format_tokens(tokens)
                             ))
                             .size(9.5)
-                            .color(theme::MUTED),
+                            .color(theme::c().text_secondary),
                         );
                     }
                 });
@@ -838,41 +886,82 @@ impl MuninnApp {
     }
 
     fn empty_state(&mut self, ui: &mut Ui) {
-        ui.add_space((ui.available_height() * 0.16).clamp(24.0, 120.0));
+        let top = ((ui.available_height() - 320.0) * 0.22).clamp(12.0, 140.0);
+        ui.add_space(top);
+
         ui.vertical_centered(|ui| {
-            ui.label(RichText::new("Чем помочь?").size(24.0).strong());
-            ui.add_space(4.0);
+            let (rect, _) = ui.allocate_exact_size(Vec2::splat(56.0), Sense::hover());
+            ui.painter()
+                .circle_filled(rect.center(), 28.0, theme::c().accent_soft);
+            ui.painter()
+                .circle_stroke(rect.center(), 27.0, Stroke::new(1.0, theme::c().border));
+            ui.painter().text(
+                rect.center(),
+                Align2::CENTER_CENTER,
+                "M",
+                FontId::proportional(22.0),
+                theme::c().accent,
+            );
+
+            ui.add_space(12.0);
+            ui.label(RichText::new("Чем помочь?").size(26.0).strong());
+            ui.add_space(6.0);
             ui.label(
-                RichText::new("История, ветки и файлы остаются на устройстве.")
-                    .size(12.0)
-                    .color(theme::MUTED),
+                RichText::new("История и файлы остаются на устройстве.")
+                    .size(13.0)
+                    .color(theme::c().text_secondary),
             );
         });
 
-        ui.add_space(20.0);
-        ui.horizontal_wrapped(|ui| {
-            let suggestions = ["Объясни код", "Составь план", "Переведи текст"];
-            for text in suggestions {
-                if suggestion_chip(ui, text).clicked() {
-                    self.draft = format!("{text}: ");
-                    ui.ctx()
-                        .memory_mut(|m| m.request_focus(Id::unique("composer")));
+        ui.add_space(26.0);
+
+        let width = ((ui.available_width() - 12.0) / 2.0).max(120.0);
+        let rows = [
+            [
+                ("Объясни код", "Разбери фрагмент"),
+                ("Составь план", "Шаги и сроки"),
+            ],
+            [
+                ("Переведи", "С сохранением стиля"),
+                ("Напиши письмо", "Деловое или личное"),
+            ],
+        ];
+
+        for row in rows {
+            ui.horizontal(|ui| {
+                for (title, subtitle) in row {
+                    if suggestion_card(ui, title, subtitle, width).clicked() {
+                        self.draft = format!("{title}: ");
+                        ui.ctx()
+                            .memory_mut(|m| m.request_focus(Id::unique("composer")));
+                    }
                 }
-            }
-        });
+            });
+            ui.add_space(8.0);
+        }
     }
 
     fn composer(&mut self, ui: &mut Ui, ctx: &egui::Context) {
         let mut submit = false;
 
+        let composer_id = Id::unique("composer");
+        let focused = ui.memory(|m| m.focused() == Some(composer_id));
+
         egui::Frame::new()
-            .fill(theme::CARD)
+            .fill(theme::c().surface_raised)
             .corner_radius(20)
-            .stroke(Stroke::new(1.0, theme::BORDER))
+            .stroke(Stroke::new(
+                if focused { 1.5 } else { 1.0 },
+                if focused {
+                    theme::c().accent
+                } else {
+                    theme::c().border
+                },
+            ))
             .inner_margin(Margin::symmetric(10, 8))
             .show(ui, |ui| {
                 let edit = egui::TextEdit::multiline(&mut self.draft)
-                    .id(Id::unique("composer"))
+                    .id(composer_id)
                     .hint_text("Сообщение…")
                     .desired_rows(1)
                     .desired_width(f32::INFINITY)
@@ -901,18 +990,12 @@ impl MuninnApp {
                 ui.add_space(2.0);
 
                 ui.horizontal(|ui| {
-                    if plus_button(ui).clicked() {
-                        // Attachments land here in M2.
-                    }
-                    if mic_button(ui).clicked() {
-                        // STT lands here in M2.
-                    }
-
-                    ui.add_space(2.0);
-                    if toggle_pill(ui, "Think", self.deep_think) {
+                    if self.model_entry().is_some_and(|m| m.reasoning)
+                        && toggle_pill(ui, "Think", self.deep_think)
+                    {
                         self.deep_think = !self.deep_think;
                     }
-                    if toggle_pill(ui, "Web", self.web) {
+                    if self.is_openrouter() && toggle_pill(ui, "Web", self.web) {
                         self.web = !self.web;
                     }
 
@@ -941,174 +1024,227 @@ impl MuninnApp {
         ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                ui.add_space(44.0);
+                ui.add_space(36.0);
                 ui.vertical_centered(|ui| {
-                    ui.label(RichText::new("MUNINN").size(32.0).strong());
+                    let (rect, _) = ui.allocate_exact_size(Vec2::splat(56.0), Sense::hover());
+                    ui.painter()
+                        .circle_filled(rect.center(), 28.0, theme::c().accent_soft);
+                    ui.painter().circle_stroke(
+                        rect.center(),
+                        27.0,
+                        Stroke::new(1.0, theme::c().border),
+                    );
+                    ui.painter().text(
+                        rect.center(),
+                        Align2::CENTER_CENTER,
+                        "M",
+                        FontId::proportional(22.0),
+                        theme::c().accent,
+                    );
+
+                    ui.add_space(12.0);
+                    ui.label(RichText::new("Muninn").size(28.0).strong());
                     ui.add_space(4.0);
                     ui.label(
                         RichText::new("Приватный клиент OpenRouter")
                             .size(13.0)
-                            .color(theme::MUTED),
+                            .color(theme::c().text_secondary),
                     );
                 });
 
-                ui.add_space(32.0);
+                ui.add_space(28.0);
 
-                let side = (ui.available_width() * 0.06).max(8.0);
+                let card_width = (ui.available_width() - 32.0).min(390.0);
                 ui.horizontal(|ui| {
-                    ui.add_space(side);
-                    ui.vertical(|ui| {
-                        ui.set_max_width((ui.available_width() - side).max(200.0));
-
-                        field_label(ui, "BASE URL");
-                        let base = egui::TextEdit::singleline(&mut self.base_url)
-                            .desired_width(f32::INFINITY)
-                            .hint_text(OPENROUTER_BASE)
-                            .margin(Margin::symmetric(12, 10));
-                        let base_resp = ui.add(base);
-                        ime_sync(
-                            ui,
-                            &base_resp,
-                            &mut self.base_url,
-                            &mut self.base_focus,
-                            &mut self.base_ime,
-                            &mut self.base_sel,
-                            false,
-                            false,
-                        );
-
-                        ui.add_space(12.0);
-                        field_label(ui, "API KEY");
-
-                        let key = egui::TextEdit::singleline(&mut self.api_key)
-                            .desired_width(f32::INFINITY)
-                            .hint_text("sk-or-v1-…")
-                            .password(true)
-                            .margin(Margin::symmetric(12, 10));
-                        let key_resp = ui.add(key);
-                        ime_sync(
-                            ui,
-                            &key_resp,
-                            &mut self.api_key,
-                            &mut self.key_focus,
-                            &mut self.key_ime,
-                            &mut self.key_sel,
-                            false,
-                            true,
-                        );
-
-                        ui.add_space(8.0);
-                        ui.horizontal(|ui| {
-                            if ui
-                                .add(
-                                    egui::Button::new(RichText::new("Вставить ключ").size(12.0))
-                                        .fill(theme::CARD)
-                                        .corner_radius(10),
-                                )
-                                .clicked()
-                                && let Some(text) = crate::platform::clipboard_get()
-                            {
-                                self.api_key = text.trim().to_owned();
-                                if self.key_focus {
-                                    crate::platform::set_ime_text(
-                                        &self.api_key,
-                                        self.api_key.len(),
-                                        self.api_key.len(),
+                    ui.add_space(((ui.available_width() - card_width) * 0.5).max(0.0));
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(card_width, 0.0),
+                        Layout::top_down(Align::Min),
+                        |ui| {
+                            egui::Frame::new()
+                                .fill(theme::c().surface)
+                                .corner_radius(20)
+                                .stroke(Stroke::new(1.0, theme::c().border))
+                                .inner_margin(Margin::same(16))
+                                .show(ui, |ui| {
+                                    field_label(ui, "BASE URL");
+                                    let base = egui::TextEdit::singleline(&mut self.base_url)
+                                        .desired_width(f32::INFINITY)
+                                        .hint_text(OPENROUTER_BASE)
+                                        .margin(Margin::symmetric(12, 12));
+                                    let base_resp = ui.add(base);
+                                    ime_sync(
+                                        ui,
+                                        &base_resp,
+                                        &mut self.base_url,
+                                        &mut self.base_focus,
+                                        &mut self.base_ime,
+                                        &mut self.base_sel,
+                                        false,
+                                        false,
                                     );
-                                }
-                            }
 
-                            if ui
-                                .add(
-                                    egui::Button::new(RichText::new("OpenRouter").size(12.0))
-                                        .fill(theme::CARD)
-                                        .corner_radius(10),
-                                )
-                                .clicked()
-                            {
-                                self.base_url = OPENROUTER_BASE.to_owned();
-                                if self.base_focus {
-                                    crate::platform::set_ime_text(
-                                        &self.base_url,
-                                        self.base_url.len(),
-                                        self.base_url.len(),
+                                    ui.add_space(12.0);
+                                    field_label(ui, "API KEY");
+                                    let key = egui::TextEdit::singleline(&mut self.api_key)
+                                        .desired_width(f32::INFINITY)
+                                        .hint_text("sk-or-v1-…")
+                                        .password(true)
+                                        .margin(Margin::symmetric(12, 12));
+                                    let key_resp = ui.add(key);
+                                    ime_sync(
+                                        ui,
+                                        &key_resp,
+                                        &mut self.api_key,
+                                        &mut self.key_focus,
+                                        &mut self.key_ime,
+                                        &mut self.key_sel,
+                                        false,
+                                        true,
                                     );
-                                }
-                            }
-                        });
 
-                        ui.add_space(10.0);
-                        ui.label(
-                            RichText::new(
-                                "Ключ шифруется Android Keystore и не покидает устройство.",
-                            )
-                            .size(10.5)
-                            .color(theme::MUTED),
-                        );
-                        ui.label(
-                            RichText::new(
-                                "Бесплатные модели лимитированы. Ключ: openrouter.ai/keys",
-                            )
-                            .size(10.5)
-                            .color(theme::MUTED),
-                        );
+                                    ui.add_space(8.0);
+                                    ui.horizontal(|ui| {
+                                        if ui
+                                            .add(
+                                                egui::Button::new(
+                                                    RichText::new("Вставить ключ").size(12.0),
+                                                )
+                                                .fill(theme::c().surface_raised)
+                                                .corner_radius(12)
+                                                .min_size(Vec2::new(0.0, 40.0)),
+                                            )
+                                            .clicked()
+                                            && let Some(text) = crate::platform::clipboard_get()
+                                        {
+                                            self.api_key = text.trim().to_owned();
+                                            if self.key_focus {
+                                                crate::platform::set_ime_text(
+                                                    &self.api_key,
+                                                    self.api_key.len(),
+                                                    self.api_key.len(),
+                                                );
+                                            }
+                                        }
 
-                        ui.add_space(16.0);
+                                        if ui
+                                            .add(
+                                                egui::Button::new(
+                                                    RichText::new("OpenRouter").size(12.0),
+                                                )
+                                                .fill(theme::c().surface_raised)
+                                                .corner_radius(12)
+                                                .min_size(Vec2::new(0.0, 40.0)),
+                                            )
+                                            .clicked()
+                                        {
+                                            self.base_url = OPENROUTER_BASE.to_owned();
+                                            if self.base_focus {
+                                                crate::platform::set_ime_text(
+                                                    &self.base_url,
+                                                    self.base_url.len(),
+                                                    self.base_url.len(),
+                                                );
+                                            }
+                                        }
+                                    });
 
-                        let can_connect = !self.connecting && !self.api_key.trim().is_empty();
-                        if ui
-                            .add_enabled(
-                                can_connect,
-                                egui::Button::new(
-                                    RichText::new(if self.connecting {
-                                        "Подключаюсь…"
-                                    } else {
-                                        "Подключиться"
-                                    })
-                                    .size(14.5),
-                                )
-                                .fill(if can_connect {
-                                    theme::ACCENT
-                                } else {
-                                    theme::CARD
-                                })
-                                .corner_radius(14)
-                                .min_size(Vec2::new(ui.available_width(), 46.0)),
-                            )
-                            .clicked()
-                        {
-                            hide_keyboard(ctx);
-                            self.connect(ctx);
-                        }
+                                    ui.add_space(12.0);
+                                    ui.horizontal(|ui| {
+                                        let (dot, _) = ui.allocate_exact_size(
+                                            Vec2::splat(7.0),
+                                            Sense::hover(),
+                                        );
+                                        ui.painter().circle_filled(
+                                            dot.center(),
+                                            3.0,
+                                            theme::c().success,
+                                        );
+                                        ui.label(
+                                            RichText::new(
+                                                "Ключ шифруется Android Keystore",
+                                            )
+                                            .size(10.5)
+                                            .color(theme::c().text_secondary),
+                                        );
+                                    });
+                                    ui.label(
+                                        RichText::new(
+                                            "Бесплатные модели лимитированы. Ключ: openrouter.ai/keys",
+                                        )
+                                        .size(10.5)
+                                        .color(theme::c().warning),
+                                    );
 
-                        if self.connecting {
-                            ui.add_space(10.0);
-                            ui.horizontal(|ui| {
-                                ui.spinner();
-                                ui.label(
-                                    RichText::new("проверяю ключ и загружаю модели")
-                                        .size(11.0)
-                                        .color(theme::MUTED),
-                                );
-                            });
-                        }
+                                    ui.add_space(16.0);
 
-                        if let Some(error) = &self.error {
-                            ui.add_space(10.0);
-                            ui.label(RichText::new(error).size(11.5).color(theme::DANGER));
-                        }
+                                    let can_connect =
+                                        !self.connecting && !self.api_key.trim().is_empty();
+                                    if ui
+                                        .add_enabled(
+                                            can_connect,
+                                            egui::Button::new(
+                                                RichText::new(if self.connecting {
+                                                    "Подключаюсь…"
+                                                } else {
+                                                    "Подключиться"
+                                                })
+                                                .size(15.0)
+                                                .color(if can_connect {
+                                                    theme::c().on_accent
+                                                } else {
+                                                    theme::c().text_tertiary
+                                                }),
+                                            )
+                                            .fill(if can_connect {
+                                                theme::c().accent
+                                            } else {
+                                                theme::c().surface_raised
+                                            })
+                                            .corner_radius(14)
+                                            .min_size(Vec2::new(ui.available_width(), 48.0)),
+                                        )
+                                        .clicked()
+                                    {
+                                        hide_keyboard(ctx);
+                                        self.connect(ctx);
+                                    }
 
-                        ui.add_space(8.0);
-                        if link_button(ui, "Забыть сохранённый ключ").clicked()
-                        {
-                            crate::secrets::clear();
-                            self.api_key.clear();
-                            self.error = None;
-                        }
-                    });
+                                    if self.connecting {
+                                        ui.add_space(10.0);
+                                        ui.horizontal(|ui| {
+                                            ui.spinner();
+                                            ui.label(
+                                                RichText::new(
+                                                    "проверяю ключ и загружаю модели",
+                                                )
+                                                .size(11.0)
+                                                .color(theme::c().text_secondary),
+                                            );
+                                        });
+                                    }
+
+                                    if let Some(error) = &self.error {
+                                        ui.add_space(10.0);
+                                        ui.label(
+                                            RichText::new(error)
+                                                .size(11.5)
+                                                .color(theme::c().danger),
+                                        );
+                                    }
+
+                                    ui.add_space(6.0);
+                                    if link_button(ui, "Забыть сохранённый ключ").clicked() {
+                                        crate::secrets::clear();
+                                        self.api_key.clear();
+                                        self.error = None;
+                                    }
+                                });
+                        },
+                    );
                 });
 
-                ui.add_space(40.0);
+                ui.add_space(36.0);
             });
     }
 
@@ -1125,8 +1261,7 @@ impl MuninnApp {
         let max_h = (bottom - screen.top() - 16.0).max(220.0);
         let wanted = match self.sheet {
             Sheet::Models => screen.height() * 0.72,
-            Sheet::Chats => screen.height() * 0.68,
-            Sheet::Menu => 340.0,
+            Sheet::Settings => 420.0,
             Sheet::None => 0.0,
         };
         let height = wanted.min(620.0).min(max_h);
@@ -1157,7 +1292,7 @@ impl MuninnApp {
                 ui.set_height(rect.height());
                 ui.set_clip_rect(rect);
                 egui::Frame::new()
-                    .fill(theme::SURFACE)
+                    .fill(theme::c().surface)
                     .corner_radius(CornerRadius {
                         nw: 24,
                         ne: 24,
@@ -1178,13 +1313,12 @@ impl MuninnApp {
                         ui.painter().rect_filled(
                             Rect::from_center_size(handle.center(), Vec2::new(36.0, 4.0)),
                             2,
-                            theme::BORDER,
+                            theme::c().border,
                         );
 
                         match self.sheet {
                             Sheet::Models => self.models_sheet(ui, &mut close),
-                            Sheet::Chats => self.chats_sheet(ui, &mut close),
-                            Sheet::Menu => self.menu_sheet(ui, &mut close),
+                            Sheet::Settings => self.settings_sheet(ui, &mut close),
                             Sheet::None => {}
                         }
                     });
@@ -1201,7 +1335,7 @@ impl MuninnApp {
             ui.label(
                 RichText::new(format!("{}", self.models.len()))
                     .size(10.0)
-                    .color(theme::MUTED),
+                    .color(theme::c().text_secondary),
             );
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if close_button(ui).clicked() {
@@ -1249,7 +1383,7 @@ impl MuninnApp {
         ui.label(
             RichText::new(format!("{} моделей", indices.len()))
                 .size(10.0)
-                .color(theme::MUTED),
+                .color(theme::c().text_secondary),
         );
         ui.add_space(4.0);
 
@@ -1296,75 +1430,242 @@ impl MuninnApp {
             .collect()
     }
 
-    fn chats_sheet(&mut self, ui: &mut Ui, close: &mut bool) {
-        let ctx = ui.ctx().clone();
-
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("Чаты").size(18.0).strong());
-            ui.label(
-                RichText::new(format!("{}", self.chats.len()))
-                    .size(10.0)
-                    .color(theme::MUTED),
-            );
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if close_button(ui).clicked() {
-                    *close = true;
-                }
-            });
-        });
-
-        ui.add_space(8.0);
-
-        if menu_row(ui, "+ Новый чат", "Начать новый разговор").clicked()
-        {
-            self.new_chat(&ctx);
-            *close = true;
+    fn drawer(&mut self, ctx: &egui::Context, screen: Rect, insets: Insets) {
+        let t = ctx.animate_bool(Id::unique("drawer"), self.drawer_open);
+        if !self.drawer_open && t <= 0.001 {
             return;
         }
 
-        ui.add_space(6.0);
-        ui.label(RichText::new("ИСТОРИЯ").size(9.0).color(theme::MUTED));
-        ui.add_space(4.0);
+        let width = (screen.width() * 0.86).min(340.0);
+        let bottom = screen.bottom() - insets.bottom;
 
+        let mut dismiss = false;
+        let scrim_alpha = (theme::c().scrim.a() as f32 * t) as u8;
+        egui::Area::new(Id::unique("drawer_scrim"))
+            .order(egui::Order::Middle)
+            .fixed_pos(screen.min)
+            .show(ctx, |ui| {
+                let (rect, resp) = ui.allocate_exact_size(screen.size(), Sense::click());
+                ui.painter().rect_filled(
+                    rect,
+                    0,
+                    Color32::from_rgba_unmultiplied(0, 0, 0, scrim_alpha),
+                );
+                if resp.clicked() {
+                    dismiss = true;
+                }
+            });
+
+        let x = -width * (1.0 - t);
+        let rect = Rect::from_min_size(
+            Pos2::new(x, screen.top()),
+            Vec2::new(width, bottom - screen.top()),
+        );
+
+        let mut close = false;
         let mut chosen: Option<usize> = None;
-        let list_height = (ui.available_height() - 6.0).max(120.0);
+        let mut do_new = false;
+        let mut do_settings = false;
+        let mut do_key = false;
 
-        ui.scope(|ui| {
-            ui.spacing_mut().item_spacing.y = 0.0;
-            ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .max_height(list_height)
-                .show(ui, |ui| {
-                    for index in (0..self.chats.len()).rev() {
-                        let chat = &self.chats[index];
-                        let active = index == self.active;
-                        let title = if active { &self.title } else { &chat.title };
-                        let messages = if active {
-                            self.messages.len()
-                        } else {
-                            chat.messages.len()
-                        };
-                        let subtitle =
-                            format!("{} · {}", format_cost(chat.cost), messages_label(messages));
+        egui::Area::new(Id::unique("drawer"))
+            .order(egui::Order::Foreground)
+            .constrain(false)
+            .fixed_pos(rect.min)
+            .show(ctx, |ui| {
+                ui.set_width(rect.width());
+                ui.set_height(rect.height());
+                ui.set_clip_rect(rect);
 
-                        if chat_row(ui, title, &subtitle, active, ui.available_width()).clicked() {
-                            chosen = Some(index);
+                egui::Frame::new()
+                    .fill(theme::c().surface)
+                    .corner_radius(CornerRadius {
+                        nw: 0,
+                        ne: 18,
+                        sw: 0,
+                        se: 18,
+                    })
+                    .inner_margin(Margin {
+                        left: 16,
+                        right: 16,
+                        top: (insets.top as i8).saturating_add(8),
+                        bottom: (insets.bottom as i8).saturating_add(8),
+                    })
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let (dot, _) = ui.allocate_exact_size(Vec2::splat(8.0), Sense::hover());
+                            ui.painter().circle_filled(
+                                dot.center(),
+                                3.0,
+                                if self.screen == Screen::Chat {
+                                    theme::c().success
+                                } else {
+                                    theme::c().warning
+                                },
+                            );
+                            ui.add_space(2.0);
+                            ui.label(
+                                RichText::new("MUNINN")
+                                    .size(11.0)
+                                    .color(theme::c().accent)
+                                    .strong(),
+                            );
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if close_button(ui).clicked() {
+                                    close = true;
+                                }
+                            });
+                        });
+
+                        ui.add_space(8.0);
+
+                        let search = egui::TextEdit::singleline(&mut self.chat_query)
+                            .hint_text("Поиск по чатам")
+                            .desired_width(f32::INFINITY)
+                            .margin(Margin::symmetric(12, 10));
+                        let resp = ui.add(search);
+                        ime_sync(
+                            ui,
+                            &resp,
+                            &mut self.chat_query,
+                            &mut self.chat_search_focus,
+                            &mut self.chat_search_ime,
+                            &mut self.chat_search_sel,
+                            false,
+                            false,
+                        );
+
+                        ui.add_space(8.0);
+                        let new_chat = egui::Button::new(
+                            RichText::new("+  Новый чат")
+                                .size(14.0)
+                                .color(theme::c().on_accent),
+                        )
+                        .fill(theme::c().accent)
+                        .corner_radius(14)
+                        .min_size(Vec2::new(ui.available_width(), 44.0));
+                        if ui.add(new_chat).clicked() {
+                            do_new = true;
                         }
-                    }
-                });
-        });
 
+                        ui.add_space(10.0);
+                        ui.label(
+                            RichText::new("ЧАТЫ")
+                                .size(9.0)
+                                .color(theme::c().text_tertiary),
+                        );
+                        ui.add_space(4.0);
+
+                        let footer_space = 112.0;
+                        let list_height = (ui.available_height() - footer_space).max(120.0);
+                        let query = self.chat_query.trim().to_lowercase();
+                        let indices: Vec<usize> = (0..self.chats.len())
+                            .rev()
+                            .filter(|index| {
+                                let chat = &self.chats[*index];
+                                let title = if *index == self.active {
+                                    &self.title
+                                } else {
+                                    &chat.title
+                                };
+                                let preview = if *index == self.active {
+                                    self.messages.last().map(|m| m.text.as_str()).unwrap_or("")
+                                } else {
+                                    chat.messages.last().map(|m| m.text.as_str()).unwrap_or("")
+                                };
+                                query.is_empty()
+                                    || title.to_lowercase().contains(&query)
+                                    || preview.to_lowercase().contains(&query)
+                            })
+                            .collect();
+
+                        ui.scope(|ui| {
+                            ui.spacing_mut().item_spacing.y = 0.0;
+                            ScrollArea::vertical()
+                                .auto_shrink([false, false])
+                                .max_height(list_height)
+                                .show(ui, |ui| {
+                                    for index in indices {
+                                        let chat = &self.chats[index];
+                                        let active = index == self.active;
+                                        let title = if active { &self.title } else { &chat.title };
+                                        let preview = if active {
+                                            self.messages
+                                                .last()
+                                                .map(|m| m.text.as_str())
+                                                .unwrap_or("Пустой чат")
+                                        } else {
+                                            chat.messages
+                                                .last()
+                                                .map(|m| m.text.as_str())
+                                                .unwrap_or("Пустой чат")
+                                        };
+                                        let time = if active {
+                                            "сейчас".to_owned()
+                                        } else {
+                                            relative_time(chat.updated_at)
+                                        };
+
+                                        if drawer_chat_row(
+                                            ui,
+                                            title,
+                                            preview,
+                                            &time,
+                                            active,
+                                            ui.available_width(),
+                                        )
+                                        .clicked()
+                                        {
+                                            chosen = Some(index);
+                                        }
+                                    }
+                                });
+                        });
+
+                        ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
+                            if menu_row(ui, "Сменить ключ", "Keystore и автоподключение").clicked()
+                            {
+                                do_key = true;
+                            }
+                            if menu_row(ui, "Настройки", "тема, ключ, о приложении").clicked()
+                            {
+                                do_settings = true;
+                            }
+                        });
+                    });
+            });
+
+        if dismiss || close {
+            self.drawer_open = false;
+            hide_keyboard(ctx);
+        }
+        if do_new {
+            self.new_chat(ctx);
+            self.drawer_open = false;
+            return;
+        }
+        if do_settings {
+            self.drawer_open = false;
+            self.sheet = Sheet::Settings;
+            hide_keyboard(ctx);
+            return;
+        }
+        if do_key {
+            self.drawer_open = false;
+            self.change_key(ctx);
+            return;
+        }
         if let Some(index) = chosen {
-            self.switch_chat(&ctx, index);
-            *close = true;
+            self.switch_chat(ctx, index);
+            self.drawer_open = false;
         }
     }
 
-    fn menu_sheet(&mut self, ui: &mut Ui, close: &mut bool) {
+    fn settings_sheet(&mut self, ui: &mut Ui, close: &mut bool) {
         let ctx = ui.ctx().clone();
 
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Muninn").size(18.0).strong());
+            ui.label(RichText::new("Настройки").size(18.0).strong());
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if close_button(ui).clicked() {
                     *close = true;
@@ -1373,22 +1674,34 @@ impl MuninnApp {
         });
 
         ui.add_space(10.0);
+        ui.label(
+            RichText::new("ТЕМА")
+                .size(9.0)
+                .color(theme::c().text_tertiary),
+        );
+        ui.add_space(6.0);
 
-        if menu_row(ui, "Чаты", &format!("{} сохранено", self.chats.len())).clicked() {
-            self.sheet = Sheet::Chats;
-            self.model_search_focus = false;
-            hide_keyboard(&ctx);
-        }
-        if menu_row(ui, "Новый чат", "Начать новый разговор").clicked() {
-            self.new_chat(&ctx);
-            *close = true;
-        }
+        let card_width = ((ui.available_width() - 16.0) / 3.0).max(80.0);
+        ui.horizontal(|ui| {
+            for mode in [theme::Mode::Dark, theme::Mode::Amoled, theme::Mode::Light] {
+                if theme_card(ui, mode, self.theme_mode == mode, card_width).clicked() {
+                    self.theme_mode = mode;
+                    theme::set_mode(&ctx, mode);
+                    self.persist();
+                }
+            }
+        });
+
+        ui.add_space(14.0);
+        ui.separator();
+        ui.add_space(8.0);
+
         if menu_row(ui, "Сменить ключ", "Keystore и автоподключение").clicked()
         {
             self.change_key(&ctx);
             *close = true;
         }
-        if menu_row(ui, "Настройки", "темы, память, агент — в следующих сборках").clicked()
+        if menu_row(ui, "О приложении", "Muninn 0.1 · локально, без телеметрии").clicked()
         {
             // Reserved.
         }
@@ -1400,10 +1713,15 @@ impl eframe::App for MuninnApp {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         self.drain_events(ui.ctx());
 
-        if crate::platform::take_back_requested() && self.sheet != Sheet::None {
-            self.close_sheet(ui.ctx());
+        if crate::platform::take_back_requested() {
+            if self.drawer_open {
+                self.drawer_open = false;
+                hide_keyboard(ui.ctx());
+            } else if self.sheet != Sheet::None {
+                self.close_sheet(ui.ctx());
+            }
         }
-        crate::platform::set_back_handled(self.sheet != Sheet::None);
+        crate::platform::set_back_handled(self.drawer_open || self.sheet != Sheet::None);
 
         let screen = ui.max_rect();
         let insets = crate::platform::system_insets(ui);
@@ -1412,7 +1730,7 @@ impl eframe::App for MuninnApp {
             egui::Panel::top("muninn_safe_top")
                 .exact_size(insets.top)
                 .show_separator_line(false)
-                .frame(egui::Frame::new().fill(theme::SURFACE))
+                .frame(egui::Frame::new().fill(theme::c().surface))
                 .show(ui, |_| {});
         }
 
@@ -1420,7 +1738,7 @@ impl eframe::App for MuninnApp {
             egui::Panel::bottom("muninn_safe_bottom")
                 .exact_size(insets.bottom)
                 .show_separator_line(false)
-                .frame(egui::Frame::new().fill(theme::BG))
+                .frame(egui::Frame::new().fill(theme::c().bg))
                 .show(ui, |_| {});
         }
 
@@ -1432,18 +1750,18 @@ impl eframe::App for MuninnApp {
                 egui::CentralPanel::default()
                     .frame(
                         egui::Frame::new()
-                            .fill(theme::BG)
+                            .fill(theme::c().bg)
                             .inner_margin(Margin::symmetric(side, 0)),
                     )
                     .show(ui, |ui| self.onboarding(ui, &ctx));
             }
             Screen::Chat => {
                 egui::Panel::top("muninn_header")
-                    .exact_size(56.0)
+                    .exact_size(60.0)
                     .show_separator_line(true)
                     .frame(
                         egui::Frame::new()
-                            .fill(theme::SURFACE)
+                            .fill(theme::c().surface)
                             .inner_margin(Margin::symmetric(12, 8)),
                     )
                     .show(ui, |ui| self.header(ui));
@@ -1451,7 +1769,7 @@ impl eframe::App for MuninnApp {
                 egui::Panel::bottom("muninn_composer")
                     .frame(
                         egui::Frame::new()
-                            .fill(theme::BG)
+                            .fill(theme::c().bg)
                             .inner_margin(Margin::symmetric(10, 8)),
                     )
                     .show(ui, |ui| self.composer(ui, &ctx));
@@ -1459,7 +1777,7 @@ impl eframe::App for MuninnApp {
                 egui::CentralPanel::default()
                     .frame(
                         egui::Frame::new()
-                            .fill(theme::BG)
+                            .fill(theme::c().bg)
                             .inner_margin(Margin::symmetric(side, 0)),
                     )
                     .show(ui, |ui| {
@@ -1483,11 +1801,12 @@ impl eframe::App for MuninnApp {
             }
         }
 
+        self.drawer(&ctx, screen, insets);
         self.sheets(&ctx, screen, insets);
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        let c = theme::BG;
+        let c = theme::c().bg;
         [
             c.r() as f32 / 255.0,
             c.g() as f32 / 255.0,
@@ -1502,59 +1821,68 @@ impl eframe::App for MuninnApp {
 // ----------------------------------------------------------------------
 
 fn avatar(ui: &mut Ui) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(24.0), Sense::hover());
     ui.painter()
-        .circle_filled(rect.center(), 9.0, theme::ACCENT_SOFT);
+        .circle_filled(rect.center(), 12.0, theme::c().accent_soft);
+    ui.painter()
+        .circle_stroke(rect.center(), 11.5, Stroke::new(1.0, theme::c().border));
     ui.painter().text(
         rect.center(),
         Align2::CENTER_CENTER,
         "M",
-        FontId::proportional(10.0),
-        theme::ACCENT,
+        FontId::proportional(11.0),
+        theme::c().accent,
     );
 }
 
 fn typing_dot(ui: &mut Ui) {
-    let time = ui.input(|i| i.time) as f32;
-    let phase = ((time * 2.4).sin() * 0.5 + 0.5) * 0.75 + 0.25;
-    let (rect, _) = ui.allocate_exact_size(Vec2::splat(8.0), Sense::hover());
-    ui.painter()
-        .circle_filled(rect.center(), 3.0, theme::ACCENT.gamma_multiply(phase));
+    let time = ui.input(|i| i.time);
+    for index in 0..3 {
+        let phase = ((time * 3.0 + index as f64 * 0.6).sin() * 0.5 + 0.5) * 0.75 + 0.25;
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(6.0, 14.0), Sense::hover());
+        ui.painter().circle_filled(
+            rect.center(),
+            2.2,
+            theme::c().accent.gamma_multiply(phase as f32),
+        );
+    }
 }
 
 fn menu_button(ui: &mut Ui) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(34.0), Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(44.0), Sense::click());
     let color = if resp.hovered() {
-        theme::TEXT
+        theme::c().text
     } else {
-        theme::MUTED
+        theme::c().text_secondary
     };
     if resp.hovered() {
-        ui.painter().rect_filled(rect, 10, theme::CARD_HOVER);
+        ui.painter()
+            .rect_filled(rect, 10, theme::c().surface_overlay);
     }
     let p = ui.painter();
     let c = rect.center();
-    for dy in [-5.0, 0.0, 5.0] {
+    for dy in [-6.0, 0.0, 6.0] {
         p.line_segment(
             [
-                Pos2::new(c.x - 7.0, c.y + dy),
-                Pos2::new(c.x + 7.0, c.y + dy),
+                Pos2::new(c.x - 8.0, c.y + dy),
+                Pos2::new(c.x + 8.0, c.y + dy),
             ],
-            Stroke::new(1.5, color),
+            Stroke::new(1.6, color),
         );
     }
     resp
 }
 
 fn close_button(ui: &mut Ui) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(32.0), Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(44.0), Sense::click());
     let color = if resp.hovered() {
-        theme::TEXT
+        theme::c().text
     } else {
-        theme::MUTED
+        theme::c().text_secondary
     };
     if resp.hovered() {
-        ui.painter().rect_filled(rect, 9, theme::CARD_HOVER);
+        ui.painter()
+            .rect_filled(rect, 9, theme::c().surface_overlay);
     }
     let c = rect.center();
     let p = ui.painter();
@@ -1575,86 +1903,22 @@ fn close_button(ui: &mut Ui) -> egui::Response {
     resp
 }
 
-fn plus_button(ui: &mut Ui) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(30.0), Sense::click());
-    let color = if resp.hovered() {
-        theme::TEXT
-    } else {
-        theme::MUTED
-    };
-    if resp.hovered() {
-        ui.painter().rect_filled(rect, 9, theme::CARD_HOVER);
-    }
-    let c = rect.center();
-    let p = ui.painter();
-    p.line_segment(
-        [Pos2::new(c.x - 6.0, c.y), Pos2::new(c.x + 6.0, c.y)],
-        Stroke::new(1.5, color),
-    );
-    p.line_segment(
-        [Pos2::new(c.x, c.y - 6.0), Pos2::new(c.x, c.y + 6.0)],
-        Stroke::new(1.5, color),
-    );
-    resp
-}
-
-fn mic_button(ui: &mut Ui) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(30.0), Sense::click());
-    let color = if resp.hovered() {
-        theme::TEXT
-    } else {
-        theme::MUTED
-    };
-    if resp.hovered() {
-        ui.painter().rect_filled(rect, 9, theme::CARD_HOVER);
-    }
-    let c = rect.center();
-    let p = ui.painter();
-    p.rect_filled(
-        Rect::from_center_size(Pos2::new(c.x, c.y - 2.0), Vec2::new(6.0, 10.0)),
-        3,
-        color,
-    );
-    p.line_segment(
-        [
-            Pos2::new(c.x - 4.0, c.y + 2.0),
-            Pos2::new(c.x - 4.0, c.y + 4.0),
-        ],
-        Stroke::new(1.4, color),
-    );
-    p.line_segment(
-        [
-            Pos2::new(c.x + 4.0, c.y + 2.0),
-            Pos2::new(c.x + 4.0, c.y + 4.0),
-        ],
-        Stroke::new(1.4, color),
-    );
-    p.line_segment(
-        [
-            Pos2::new(c.x - 4.0, c.y + 4.0),
-            Pos2::new(c.x + 4.0, c.y + 4.0),
-        ],
-        Stroke::new(1.4, color),
-    );
-    p.line_segment(
-        [Pos2::new(c.x, c.y + 4.0), Pos2::new(c.x, c.y + 7.0)],
-        Stroke::new(1.4, color),
-    );
-    resp
-}
-
 fn send_button(ui: &mut Ui, enabled: bool) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(34.0), Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(44.0), Sense::click());
     let fill = if enabled {
-        theme::ACCENT
+        if resp.hovered() {
+            theme::c().accent_hover
+        } else {
+            theme::c().accent
+        }
     } else {
-        theme::CARD_HOVER
+        theme::c().surface_overlay
     };
-    ui.painter().circle_filled(rect.center(), 17.0, fill);
+    ui.painter().circle_filled(rect.center(), 22.0, fill);
     let color = if enabled {
-        Color32::WHITE
+        theme::c().on_accent
     } else {
-        theme::MUTED
+        theme::c().text_secondary
     };
     let c = rect.center();
     let p = ui.painter();
@@ -1675,29 +1939,30 @@ fn send_button(ui: &mut Ui, enabled: bool) -> egui::Response {
 
 fn stop_button(ui: &mut Ui) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(62.0, 32.0), Sense::click());
-    ui.painter().rect_filled(rect, 16, theme::CARD_HOVER);
+    ui.painter()
+        .rect_filled(rect, 16, theme::c().surface_overlay);
     let p = ui.painter();
     p.rect_filled(
         Rect::from_center_size(rect.center(), Vec2::new(9.0, 9.0)),
         2,
-        theme::TEXT,
+        theme::c().text,
     );
     resp
 }
 
 fn toggle_pill(ui: &mut Ui, label: &str, active: bool) -> bool {
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(56.0, 26.0), Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(64.0, 34.0), Sense::click());
     let fill = if active {
-        theme::ACCENT_SOFT
+        theme::c().accent_soft
     } else if resp.hovered() {
-        theme::CARD_HOVER
+        theme::c().surface_overlay
     } else {
         Color32::TRANSPARENT
     };
     let stroke = if active {
         Stroke::NONE
     } else {
-        Stroke::new(1.0, theme::BORDER)
+        Stroke::new(1.0, theme::c().border)
     };
     ui.painter()
         .rect(rect, 13, fill, stroke, egui::StrokeKind::Inside);
@@ -1706,24 +1971,28 @@ fn toggle_pill(ui: &mut Ui, label: &str, active: bool) -> bool {
         Align2::CENTER_CENTER,
         label,
         FontId::proportional(10.5),
-        if active { theme::ACCENT } else { theme::MUTED },
+        if active {
+            theme::c().accent
+        } else {
+            theme::c().text_secondary
+        },
     );
     resp.clicked()
 }
 
 fn filter_chip(ui: &mut Ui, label: &str, active: bool) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(58.0, 26.0), Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(64.0, 32.0), Sense::click());
     let fill = if active {
-        theme::ACCENT_SOFT
+        theme::c().accent_soft
     } else if resp.hovered() {
-        theme::CARD_HOVER
+        theme::c().surface_overlay
     } else {
         Color32::TRANSPARENT
     };
     let stroke = if active {
         Stroke::NONE
     } else {
-        Stroke::new(1.0, theme::BORDER)
+        Stroke::new(1.0, theme::c().border)
     };
     ui.painter()
         .rect(rect, 13, fill, stroke, egui::StrokeKind::Inside);
@@ -1732,54 +2001,75 @@ fn filter_chip(ui: &mut Ui, label: &str, active: bool) -> egui::Response {
         Align2::CENTER_CENTER,
         label,
         FontId::proportional(10.5),
-        if active { theme::ACCENT } else { theme::MUTED },
+        if active {
+            theme::c().accent
+        } else {
+            theme::c().text_secondary
+        },
     );
     resp
 }
 
-fn suggestion_chip(ui: &mut Ui, label: &str) -> egui::Response {
-    let width = 96.0;
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 34.0), Sense::click());
+fn suggestion_card(ui: &mut Ui, title: &str, subtitle: &str, width: f32) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 68.0), Sense::click());
     let fill = if resp.hovered() {
-        theme::CARD_HOVER
+        theme::c().surface_overlay
     } else {
-        theme::CARD
+        theme::c().surface_raised
     };
-    ui.painter().rect_filled(rect, 17, fill);
-    ui.painter().text(
-        rect.center(),
-        Align2::CENTER_CENTER,
-        label,
-        FontId::proportional(11.0),
-        theme::TEXT,
+    ui.painter().rect(
+        rect,
+        16,
+        fill,
+        Stroke::new(1.0, theme::c().border),
+        egui::StrokeKind::Inside,
+    );
+
+    let dot = Pos2::new(rect.left() + 16.0, rect.top() + 20.0);
+    ui.painter().circle_filled(dot, 4.0, theme::c().accent);
+
+    let p = ui.painter().with_clip_rect(rect);
+    p.text(
+        Pos2::new(rect.left() + 28.0, rect.top() + 11.0),
+        Align2::LEFT_TOP,
+        title,
+        FontId::proportional(13.0),
+        theme::c().text,
+    );
+    p.text(
+        Pos2::new(rect.left() + 28.0, rect.top() + 32.0),
+        Align2::LEFT_TOP,
+        subtitle,
+        FontId::proportional(10.0),
+        theme::c().text_secondary,
     );
     resp
 }
 
 fn model_chip(ui: &mut Ui, label: &str, width: f32) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 32.0), Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 40.0), Sense::click());
     let fill = if resp.hovered() {
-        theme::CARD_HOVER
+        theme::c().surface_overlay
     } else {
-        theme::CARD
+        theme::c().surface_raised
     };
-    ui.painter().rect_filled(rect, 16, fill);
+    ui.painter().rect_filled(rect, 20, fill);
     let p = ui.painter().with_clip_rect(rect);
     p.text(
         Pos2::new(rect.left() + 12.0, rect.center().y),
         Align2::LEFT_CENTER,
         truncate(label, 19),
-        FontId::proportional(12.0),
-        theme::TEXT,
+        FontId::proportional(12.5),
+        theme::c().text,
     );
     let c = Pos2::new(rect.right() - 14.0, rect.center().y - 1.0);
     p.line_segment(
         [Pos2::new(c.x - 3.0, c.y - 2.0), Pos2::new(c.x, c.y + 2.0)],
-        Stroke::new(1.4, theme::MUTED),
+        Stroke::new(1.4, theme::c().text_secondary),
     );
     p.line_segment(
         [Pos2::new(c.x + 3.0, c.y - 2.0), Pos2::new(c.x, c.y + 2.0)],
-        Stroke::new(1.4, theme::MUTED),
+        Stroke::new(1.4, theme::c().text_secondary),
     );
     resp
 }
@@ -1787,9 +2077,9 @@ fn model_chip(ui: &mut Ui, label: &str, width: f32) -> egui::Response {
 fn model_row(ui: &mut Ui, model: &ModelEntry, selected: bool, width: f32) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 64.0), Sense::click());
     let fill = if selected {
-        theme::ACCENT_SOFT
+        theme::c().accent_soft
     } else if resp.hovered() {
-        theme::CARD_HOVER
+        theme::c().surface_overlay
     } else {
         Color32::TRANSPARENT
     };
@@ -1809,14 +2099,14 @@ fn model_row(ui: &mut Ui, model: &ModelEntry, selected: bool, width: f32) -> egu
         Align2::LEFT_TOP,
         truncate(name, 30),
         FontId::proportional(13.5),
-        theme::TEXT,
+        theme::c().text,
     );
     p.text(
         Pos2::new(rect.left() + 12.0, rect.top() + 28.0),
         Align2::LEFT_TOP,
         truncate(&model.id, 38),
         FontId::proportional(9.5),
-        theme::MUTED,
+        theme::c().text_secondary,
     );
 
     let mut badges = Vec::new();
@@ -1838,9 +2128,9 @@ fn model_row(ui: &mut Ui, model: &ModelEntry, selected: bool, width: f32) -> egu
         badges.join(" · "),
         FontId::proportional(9.0),
         if selected {
-            theme::ACCENT
+            theme::c().accent
         } else {
-            theme::MUTED
+            theme::c().text_secondary
         },
     );
 
@@ -1855,9 +2145,9 @@ fn model_row(ui: &mut Ui, model: &ModelEntry, selected: bool, width: f32) -> egu
         price,
         FontId::proportional(10.0),
         if model.free {
-            theme::ACCENT
+            theme::c().accent
         } else {
-            theme::MUTED
+            theme::c().text_secondary
         },
     );
     p.text(
@@ -1865,24 +2155,68 @@ fn model_row(ui: &mut Ui, model: &ModelEntry, selected: bool, width: f32) -> egu
         Align2::RIGHT_TOP,
         format!("{} ctx", format_tokens(model.context)),
         FontId::proportional(9.0),
-        theme::MUTED,
+        theme::c().text_secondary,
     );
 
     resp
 }
 
-fn chat_row(
+fn theme_card(ui: &mut Ui, mode: theme::Mode, selected: bool, width: f32) -> egui::Response {
+    let palette = mode_palette(mode);
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 76.0), Sense::click());
+    let fill = if selected {
+        theme::c().accent_soft
+    } else if resp.hovered() {
+        theme::c().surface_overlay
+    } else {
+        theme::c().surface_raised
+    };
+    let stroke = if selected {
+        Stroke::new(1.5, theme::c().accent)
+    } else {
+        Stroke::new(1.0, theme::c().border)
+    };
+    ui.painter()
+        .rect(rect, 14, fill, stroke, egui::StrokeKind::Inside);
+
+    let swatch = egui::Rect::from_min_size(
+        egui::Pos2::new(rect.left() + 12.0, rect.top() + 12.0),
+        Vec2::new(28.0, 28.0),
+    );
+    ui.painter()
+        .circle_filled(swatch.center(), 14.0, palette.bg);
+    ui.painter()
+        .circle_stroke(swatch.center(), 13.0, Stroke::new(1.0, palette.border));
+    ui.painter()
+        .circle_filled(swatch.center() + Vec2::new(6.0, 6.0), 5.0, palette.accent);
+
+    ui.painter().text(
+        egui::Pos2::new(rect.left() + 12.0, rect.top() + 50.0),
+        Align2::LEFT_TOP,
+        mode.label(),
+        FontId::proportional(11.5),
+        theme::c().text,
+    );
+    resp
+}
+
+fn mode_palette(mode: theme::Mode) -> theme::Palette {
+    theme::palette_of(mode)
+}
+
+fn drawer_chat_row(
     ui: &mut Ui,
     title: &str,
-    subtitle: &str,
+    preview: &str,
+    time: &str,
     selected: bool,
     width: f32,
 ) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 56.0), Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 64.0), Sense::click());
     let fill = if selected {
-        theme::ACCENT_SOFT
+        theme::c().accent_soft
     } else if resp.hovered() {
-        theme::CARD_HOVER
+        theme::c().surface_overlay
     } else {
         Color32::TRANSPARENT
     };
@@ -1892,18 +2226,25 @@ fn chat_row(
 
     let p = ui.painter().with_clip_rect(rect);
     p.text(
-        egui::Pos2::new(rect.left() + 12.0, rect.top() + 9.0),
+        Pos2::new(rect.left() + 10.0, rect.top() + 9.0),
         Align2::LEFT_TOP,
-        truncate(title, 34),
-        FontId::proportional(13.5),
-        theme::TEXT,
+        truncate(title, 28),
+        FontId::proportional(13.0),
+        theme::c().text,
     );
     p.text(
-        egui::Pos2::new(rect.left() + 12.0, rect.top() + 30.0),
+        Pos2::new(rect.right() - 10.0, rect.top() + 10.0),
+        Align2::RIGHT_TOP,
+        time,
+        FontId::proportional(9.0),
+        theme::c().text_tertiary,
+    );
+    p.text(
+        Pos2::new(rect.left() + 10.0, rect.top() + 32.0),
         Align2::LEFT_TOP,
-        subtitle,
-        FontId::proportional(9.5),
-        theme::MUTED,
+        truncate(preview.replace('\n', " ").trim(), 30),
+        FontId::proportional(10.5),
+        theme::c().text_secondary,
     );
     resp
 }
@@ -1913,7 +2254,7 @@ fn menu_row(ui: &mut Ui, title: &str, subtitle: &str) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 58.0), Sense::click());
     if resp.hovered() {
         ui.painter()
-            .rect_filled(rect.shrink(2.0), 12, theme::CARD_HOVER);
+            .rect_filled(rect.shrink(2.0), 12, theme::c().surface_overlay);
     }
     let p = ui.painter().with_clip_rect(rect);
     p.text(
@@ -1921,28 +2262,30 @@ fn menu_row(ui: &mut Ui, title: &str, subtitle: &str) -> egui::Response {
         Align2::LEFT_TOP,
         title,
         FontId::proportional(14.0),
-        theme::TEXT,
+        theme::c().text,
     );
     p.text(
         Pos2::new(rect.left() + 12.0, rect.top() + 30.0),
         Align2::LEFT_TOP,
         subtitle,
         FontId::proportional(9.5),
-        theme::MUTED,
+        theme::c().text_secondary,
     );
     resp
 }
 
 fn link_button(ui: &mut Ui, label: &str) -> egui::Response {
-    let galley =
-        ui.painter()
-            .layout_no_wrap(label.to_owned(), FontId::proportional(9.5), theme::MUTED);
+    let galley = ui.painter().layout_no_wrap(
+        label.to_owned(),
+        FontId::proportional(9.5),
+        theme::c().text_secondary,
+    );
     let (rect, resp) =
         ui.allocate_exact_size(Vec2::new(galley.size().x + 4.0, 18.0), Sense::click());
     ui.painter().galley(
         Pos2::new(rect.left() + 2.0, rect.center().y - galley.size().y * 0.5),
         galley,
-        theme::MUTED,
+        theme::c().text_secondary,
     );
     resp
 }
@@ -1952,7 +2295,12 @@ fn link_button(ui: &mut Ui, label: &str) -> egui::Response {
 // ----------------------------------------------------------------------
 
 fn field_label(ui: &mut Ui, text: &str) {
-    ui.label(RichText::new(text).size(9.5).color(theme::MUTED).strong());
+    ui.label(
+        RichText::new(text)
+            .size(9.5)
+            .color(theme::c().text_secondary)
+            .strong(),
+    );
     ui.add_space(2.0);
 }
 
@@ -2108,6 +2456,22 @@ fn friendly_error(raw: &str) -> String {
     }
 }
 
+fn relative_time(timestamp: u64) -> String {
+    let now = now_secs();
+    let delta = now.saturating_sub(timestamp);
+    if delta < 60 {
+        "сейчас".to_owned()
+    } else if delta < 3600 {
+        format!("{} мин", delta / 60)
+    } else if delta < 86_400 {
+        format!("{} ч", delta / 3600)
+    } else if delta < 86_400 * 7 {
+        format!("{} д", delta / 86_400)
+    } else {
+        format!("{} нед", delta / (86_400 * 7))
+    }
+}
+
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2120,19 +2484,4 @@ fn next_id() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_nanos() as u64)
         .unwrap_or(0)
-}
-
-fn messages_label(count: usize) -> String {
-    let last_two = count % 100;
-    let last = count % 10;
-    let word = if (11..=14).contains(&last_two) {
-        "сообщений"
-    } else {
-        match last {
-            1 => "сообщение",
-            2..=4 => "сообщения",
-            _ => "сообщений",
-        }
-    };
-    format!("{count} {word}")
 }
