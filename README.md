@@ -79,3 +79,14 @@ scripts/        build helpers
 ## Licence
 
 GPL-3.0-or-later.
+
+## Releases
+
+Signed APKs are published on the
+[releases page](https://github.com/d3adp0rt/muninn/releases). Only
+`arm64-v8a` is built; Android 8.0 (API 26) or newer is required.
+
+CI status: [![CI](https://github.com/d3adp0rt/muninn/actions/workflows/ci.yml/badge.svg)](https://github.com/d3adp0rt/muninn/actions/workflows/ci.yml)
+
+Release signing, secrets and the tag procedure are documented in
+[docs/RELEASE.md](docs/RELEASE.md).
