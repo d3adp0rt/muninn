@@ -212,7 +212,7 @@ pub fn keystore_seal(plaintext: &[u8]) -> Option<Vec<u8>> {
         }
     };
     let obj: JObject = array.into();
-    let value = match env.call_method(&activity, "muninnSeal", "([B)[B", &[JValue::Object(&obj)]) {
+    let value = match env.call_method(activity, "muninnSeal", "([B)[B", &[JValue::Object(&obj)]) {
         Ok(value) => value,
         Err(err) => {
             log::warn!("keystore: call {err:?}");

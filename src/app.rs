@@ -160,12 +160,12 @@ impl MuninnApp {
             };
 
             // `/models` is public on OpenRouter, so it cannot validate a key.
-            if base.contains("openrouter.ai") {
-                if let Err(err) = client.key_info().await {
-                    let _ = tx.send(UiEvent::ConnectError(friendly_error(&err.to_string())));
-                    ctx.request_repaint();
-                    return;
-                }
+            if base.contains("openrouter.ai")
+                && let Err(err) = client.key_info().await
+            {
+                let _ = tx.send(UiEvent::ConnectError(friendly_error(&err.to_string())));
+                ctx.request_repaint();
+                return;
             }
 
             match client.list_models().await {
@@ -645,10 +645,10 @@ impl MuninnApp {
                     if !self.ime_focused {
                         crate::platform::set_ime_text(&self.draft, self.draft.len());
                         self.ime_focused = true;
-                    } else if let Some(text) = crate::platform::ime_text() {
-                        if text != self.draft {
-                            self.draft = text;
-                        }
+                    } else if let Some(text) = crate::platform::ime_text()
+                        && text != self.draft
+                    {
+                        self.draft = text;
                     }
                 } else if self.ime_focused {
                     self.ime_focused = false;
@@ -842,26 +842,26 @@ impl MuninnApp {
 
                         ui.add_space(8.0);
                         ui.horizontal(|ui| {
-                            if ui.button("Вставить из буфера").clicked() {
-                                if let Some(text) = crate::platform::clipboard_get() {
-                                    self.api_key = text.trim().to_owned();
-                                    if self.key_focus {
-                                        crate::platform::set_ime_text(
-                                            &self.api_key,
-                                            self.api_key.len(),
-                                        );
-                                    }
+                            if ui.button("Вставить из буфера").clicked()
+                                && let Some(text) = crate::platform::clipboard_get()
+                            {
+                                self.api_key = text.trim().to_owned();
+                                if self.key_focus {
+                                    crate::platform::set_ime_text(
+                                        &self.api_key,
+                                        self.api_key.len(),
+                                    );
                                 }
                             }
-                            if ui.button("Вставить base URL").clicked() {
-                                if let Some(text) = crate::platform::clipboard_get() {
-                                    self.base_url = text.trim().to_owned();
-                                    if self.base_focus {
-                                        crate::platform::set_ime_text(
-                                            &self.base_url,
-                                            self.base_url.len(),
-                                        );
-                                    }
+                            if ui.button("Вставить base URL").clicked()
+                                && let Some(text) = crate::platform::clipboard_get()
+                            {
+                                self.base_url = text.trim().to_owned();
+                                if self.base_focus {
+                                    crate::platform::set_ime_text(
+                                        &self.base_url,
+                                        self.base_url.len(),
+                                    );
                                 }
                             }
                         });
@@ -1078,10 +1078,10 @@ fn ime_into(
         if !*focused {
             crate::platform::set_ime_text(text, text.len());
             *focused = true;
-        } else if let Some(ime) = crate::platform::ime_text() {
-            if ime != *text {
-                *text = ime;
-            }
+        } else if let Some(ime) = crate::platform::ime_text()
+            && ime != *text
+        {
+            *text = ime;
         }
     } else if *focused {
         *focused = false;

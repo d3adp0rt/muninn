@@ -45,7 +45,7 @@ pub fn save(base_url: &str, api_key: &str) -> bool {
 
     match std::fs::write(&path, &blob) {
         Ok(()) => {
-            log::info!("secrets: saved {} bytes to {}", blob.len(), path.display());
+            log::debug!("secrets: saved {} bytes to {}", blob.len(), path.display());
             true
         }
         Err(err) => {
@@ -60,7 +60,7 @@ pub fn load() -> Option<Secrets> {
     let blob = match std::fs::read(&path) {
         Ok(blob) => blob,
         Err(err) => {
-            log::info!("secrets: none at {} ({err})", path.display());
+            log::debug!("secrets: none at {} ({err})", path.display());
             return None;
         }
     };
@@ -78,7 +78,7 @@ pub fn load() -> Option<Secrets> {
         return None;
     }
 
-    log::info!("secrets: loaded key for {base_url}");
+    log::debug!("secrets: loaded key for {base_url}");
     Some(Secrets {
         base_url: base_url.to_owned(),
         api_key: api_key.to_owned(),

@@ -3,15 +3,17 @@
 ## M0 — platform proof (current)
 
 - [x] Repository + licence + CI skeleton
-- [ ] Toolchain: SDK 36, NDK 27.2, cargo-ndk, arm64 target
-- [ ] egui + eframe + GameActivity renders on device
-- [ ] IME: Cyrillic, emoji, cursor mid-string, selection, paste, insets, back
+- [x] Toolchain: SDK 36, NDK 27.2, cargo-ndk, arm64 target
+- [x] egui + eframe + GameActivity renders on device
+- [x] IME bridge (GameTextInput → egui), insets, hardware keys
+- [ ] IME: emoji picker, selection handles, mid-string cursor polish
 - [ ] 10k-message list at 60 fps with fling
-- [ ] SSE stream at 100+ tok/s with incremental markdown
+- [x] SSE streaming, reasoning, usage/cost, Stop
+- [ ] Incremental markdown rendering
 - [ ] SQLCipher + FTS5 open/query after biometric unlock
 - [ ] SAF picker, microphone → WAV, STT round-trip
 - [ ] CPython cross-compile spike (`libpyrunner.so` + stdlib zip + pip wheel)
-- [ ] Measure APK size and cold start
+- [x] APK size measured (~11 MB debug, arm64)
 
 ## M1 — chat MVP
 

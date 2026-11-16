@@ -2,8 +2,9 @@
 
 A private, local-first OpenRouter client for Android, written in Rust.
 
-> M0: the Android shell is being wired up (egui + GameActivity + wgpu).
-> Chat, keys, history and the agent land milestone by milestone.
+> M0 is done: egui + GameActivity + wgpu on device, IME bridge, insets,
+> encrypted key storage and streaming chat work. History, branches, markdown
+> and the agent are next.
 
 ## What it will be
 
@@ -31,6 +32,19 @@ A private, local-first OpenRouter client for Android, written in Rust.
 - Android NDK 27.2.12479018
 - JDK 17
 - `cargo-ndk`
+
+## Try it without an API key
+
+A local SSE mock exercises the whole path (models → stream → reasoning → usage):
+
+```bash
+python3 scripts/mock-server.py 8765
+adb reverse tcp:8765 tcp:8765
+# in Muninn: base URL http://127.0.0.1:8765/v1, any key
+```
+
+The base URL `127.0.0.1` is allowed cleartext by
+`res/xml/network_security_config.xml`; everything else requires TLS.
 
 ## Build
 
