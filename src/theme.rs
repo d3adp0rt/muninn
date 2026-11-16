@@ -14,10 +14,11 @@ pub const ACCENT_SOFT: Color32 = Color32::from_rgba_premultiplied(58, 42, 120, 2
 pub const TEXT: Color32 = Color32::from_rgb(233, 234, 239);
 pub const MUTED: Color32 = Color32::from_rgb(148, 151, 163);
 pub const BORDER: Color32 = Color32::from_rgb(38, 39, 49);
-pub const DANGER: Color32 = Color32::from_rgb(255, 112, 112);
 
 pub fn apply(ctx: &egui::Context) {
-    let mut style = (*ctx.style()).clone();
+    ctx.set_theme(egui::ThemePreference::Dark);
+
+    let mut style = (*ctx.style_of(egui::Theme::Dark)).clone();
 
     let mut v = Visuals::dark();
     v.panel_fill = BG;
@@ -48,5 +49,5 @@ pub fn apply(ctx: &egui::Context) {
     ]
     .into();
 
-    ctx.set_style(style);
+    ctx.set_style_of(egui::Theme::Dark, style);
 }

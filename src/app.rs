@@ -5,7 +5,7 @@
 //! real domain model lands.
 
 use eframe::egui::{
-    self, Align, Color32, CornerRadius, FontId, Layout, Margin, RichText, ScrollArea, Vec2,
+    self, Align, CornerRadius, Layout, Margin, RichText, ScrollArea, Vec2,
 };
 
 use crate::theme;
@@ -343,7 +343,11 @@ impl eframe::App for MuninnApp {
             .show(ui, |ui| self.composer(ui));
 
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(theme::BG))
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::BG)
+                    .inner_margin(Margin::symmetric(12, 0)),
+            )
             .show(ui, |ui| {
                 ScrollArea::vertical()
                     .auto_shrink([false, false])
@@ -351,7 +355,7 @@ impl eframe::App for MuninnApp {
                     .show(ui, |ui| {
                         ui.add_space(12.0);
                         ui.horizontal(|ui| {
-                            ui.add_space(8.0);
+                            ui.add_space(2.0);
                             ui.label(
                                 RichText::new("ЛОКАЛЬНАЯ ИСТОРИЯ · ШИФРОВАНИЕ ВКЛ")
                                     .size(9.5)
@@ -361,11 +365,7 @@ impl eframe::App for MuninnApp {
                         ui.add_space(14.0);
 
                         for msg in &self.messages {
-                            ui.horizontal(|ui| {
-                                ui.add_space(8.0);
-                                ui.vertical(|ui| self.bubble(ui, msg));
-                                ui.add_space(8.0);
-                            });
+                            self.bubble(ui, msg);
                         }
 
                         if self.messages.is_empty() {
@@ -386,10 +386,4 @@ impl eframe::App for MuninnApp {
             1.0,
         ]
     }
-}
-
-// Keep `Color32` and `FontId` imports used even as the UI evolves.
-#[allow(dead_code)]
-fn _palette_anchor() -> (Color32, FontId) {
-    (Color32::WHITE, FontId::proportional(14.0))
 }
